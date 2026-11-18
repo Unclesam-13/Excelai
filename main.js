@@ -2407,6 +2407,222 @@ class TableWorkbenchView extends ItemView {
     const last = this.settings.lastTable && this.app.vault.getAbstractFileByPath(this.settings.lastTable);
     if (last instanceof TFile) await this.loadFile(last, { silent: true, switchTab: false });
     await this.render();
+    this.register(() => this.endTour(false));
+    if (!this.settings.onboarded) setTimeout(() => this.startTour(), 600);
+  }
+
+  /* ================= 新手引导 ================= */
+  tourSteps() {
+    const toTab = (t) => async () => { if (this.tab !== t) { this.tab = t; await this.render(); } };
+    return [
+      { kind: 'welcome' },
+      { sel: '.ata-tabs', title: '四个页面', before: toTab('home'),
+        text: '「首页」看最近做了什么；「表格库」放所有表格（多工作表的 Excel 会归在一起）；「工作区」是打开一张表和 AI 一起填；「附件区」存收到的单据、截图、PDF。' },
+      { sel: '.ata-top-actions', title: '第一步：导入你的表格', before: toTab('home'),
+        text: '点「导入文件」或「导入文件夹」，把平时要填的 Excel / CSV 导进来，一次可以导很多个。从微信里拖不进来时，复制文件后在这里按 Ctrl+V，或点「按路径」粘贴文件路径。' },
+      { sel: '.ata-homestrip .ata-inbox', title: '收到单据就丢这里', before: toTab('home'),
+        text: '订单、送货单、价格表的截图或 PDF 拖到这里（或点一下选择），插件会推荐该填哪张表，选好后 AI 自动识别内容填进去。' },
+      { sel: '.ata-qstrip', title: '常用表一键切换', before: toTab('home'), optional: true,
+        text: '最近用过和设为常用的表会排在这里，点一下就切过去。也可以把单据直接拖到某个表名上，直接填那张表。' },
+      { sel: '.ata-oplog', title: '操作记录', before: toTab('home'),
+        text: 'AI 改了什么、你手动改了什么、导入导出和删除，都会按时间记在这里。点「查看明细」能看到每个格子原来是什么、改成了什么。' },
+      { sel: '.ata-chatpanel', title: '和 AI 一起填表', before: async () => { if (this.file) await toTab('workspace')(); }, needs: () => !!this.file,
+        alt: { sel: '.ata-tabs', text: '打开任意一张表后，「工作区」右边是 AI 对话框：用中文说要改什么，或者点回形针加图片 / PDF，AI 会给出修改。打开一张表后可以在设置里重新看这段引导。' },
+        text: '在这里用中文告诉 AI 要做什么，比如「把这张送货单加进去」「把单价都改成含税价」。点回形针可以加图片、PDF、表格。AI 改完会先标出来（黄色是修改，绿色是新增），确认后点「应用」，不满意可以「撤销」。' },
+      { sel: '.ata-export-btn', title: '导出成 Excel', before: async () => { if (this.file) await toTab('workspace')(); }, needs: () => !!this.file,
+        text: '改好后点「导出」。从 Excel 导入的表会按原文件的格式导出：颜色、公式、合并单元格、图片都保留，多个工作表一起导出成一个文件。' },
+      { sel: '.ata-archive-drop', title: '附件区', before: toTab('archive'),
+        text: '收到的文件可以先存在这里，图片和 PDF 有预览，图片能一键复制。要用时点卡片上的「送去提取」，交给 AI 填到表里。发给 AI 的附件也会自动存一份。' },
+      { kind: 'done' },
+    ];
+  }
+
+  async startTour(i) {
+    this.endTour(false);
+    this.tourIdx = i || 0;
+    const ov = this.tourEl = document.body.createDiv('ata-tour');
+    this.tourHole = ov.createDiv('ata-tour-hole');
+    this.tourCard = ov.createDiv('ata-tour-card');
+    ov.addEventListener('click', (e) => { if (e.target === ov) e.stopPropagation(); });
+    this.tourKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); this.endTour(true); }
+      else if (e.key === 'ArrowRight' && !/INPUT|SELECT|TEXTAREA/.test((document.activeElement || {}).tagName)) this.tourGo(1);
+      else if (e.key === 'ArrowLeft' && !/INPUT|SELECT|TEXTAREA/.test((document.activeElement || {}).tagName)) this.tourGo(-1);
+    };
+    this.tourResize = () => this.tourPlace();
+    document.addEventListener('keydown', this.tourKey, true);
+    window.addEventListener('resize', this.tourResize);
+    await this.tourShow();
+  }
+
+  async tourGo(d) {
+    const steps = this.tourSteps();
+    let i = this.tourIdx + d;
+    while (i > 0 && i < steps.length - 1 && steps[i].optional && !this.root.querySelector(steps[i].sel)) i += d;
+    if (i < 0) i = 0;
+    if (i >= steps.length) { this.endTour(true); return; }
+    this.tourIdx = i;
+    await this.tourShow();
+  }
+
+  async tourShow() {
+    if (!this.tourEl) return;
+    const steps = this.tourSteps();
+    let st = steps[this.tourIdx];
+    if (st.before) await st.before();
+    if (st.needs && !st.needs()) st = Object.assign({}, st, st.alt || {});
+    const card = this.tourCard;
+    card.empty();
+    card.removeClass('is-center');
+    card.removeClass('is-wide');
+    const n = steps.length - 2;
+    const close = card.createEl('button', { cls: 'ata-tour-x', attr: { 'aria-label': '关闭引导' } });
+    setIcon(close, 'x');
+    close.addEventListener('click', () => this.endTour(true));
+
+    if (st.kind === 'welcome') this.tourWelcome(card);
+    else if (st.kind === 'done') this.tourDone(card);
+    else {
+      card.createDiv({ cls: 'ata-tour-step', text: `${this.tourIdx} / ${n}` });
+      card.createDiv({ cls: 'ata-tour-title', text: st.title });
+      card.createDiv({ cls: 'ata-tour-text', text: st.text });
+      const bar = card.createDiv('ata-tour-bar');
+      const skip = bar.createEl('button', { cls: 'ata-tour-skip', text: '跳过引导' });
+      skip.addEventListener('click', () => this.endTour(true));
+      const sp = bar.createDiv('ata-tour-btns');
+      const prev = sp.createEl('button', { text: '上一步' });
+      prev.addEventListener('click', () => this.tourGo(-1));
+      const next = sp.createEl('button', { cls: 'mod-cta', text: '下一步' });
+      next.addEventListener('click', () => this.tourGo(1));
+      setTimeout(() => next.focus(), 30);
+    }
+    this.tourTarget = st.sel ? this.root.querySelector(st.sel) : null;
+    if (this.tourTarget) {
+      this.tourTarget.scrollIntoView({ block: 'nearest' });
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    this.tourPlace();
+  }
+
+  tourPlace() {
+    if (!this.tourEl) return;
+    const card = this.tourCard, hole = this.tourHole, t = this.tourTarget;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    if (!t || !t.isConnected) {
+      hole.style.display = 'none';
+      this.tourEl.addClass('is-dim');
+      card.addClass('is-center');
+      card.style.left = card.style.top = '';
+      return;
+    }
+    this.tourEl.removeClass('is-dim');
+    const r = t.getBoundingClientRect(), pad = 6;
+    const top = Math.max(4, r.top - pad), left = Math.max(4, r.left - pad);
+    const h = Math.min(r.bottom + pad, vh - 4) - top, w = Math.min(r.right + pad, vw - 4) - left;
+    Object.assign(hole.style, { display: 'block', top: top + 'px', left: left + 'px', width: w + 'px', height: Math.max(h, 20) + 'px' });
+    const cw = card.offsetWidth || 360, chh = card.offsetHeight || 200;
+    if (h > vh * 0.5 && left - cw - 16 > 8) { // 很高的目标（比如对话框）：卡片放在它左边
+      card.style.left = (left - cw - 16) + 'px';
+      card.style.top = Math.max(8, Math.min(top + 40, vh - chh - 8)) + 'px';
+      return;
+    }
+    let cy = top + h + 12;
+    if (cy + chh > vh - 8) cy = top - chh - 12;
+    if (cy < 8) cy = Math.min(vh - chh - 8, Math.max(8, top + 16)); // 目标太高时盖在目标里面
+    let cx = Math.min(Math.max(8, left + Math.min(w, 400) / 2 - cw / 2), vw - cw - 8);
+    if (cy > top && cy < top + h && left + w + cw + 20 < vw) { cx = left + w + 12; cy = Math.max(8, Math.min(top, vh - chh - 8)); }
+    card.style.left = cx + 'px';
+    card.style.top = cy + 'px';
+  }
+
+  tourWelcome(card) {
+    const s = this.settings;
+    card.addClass('is-wide');
+    card.createDiv({ cls: 'ata-tour-title big', text: '欢迎使用 AI 表格助手 👋' });
+    card.createDiv({ cls: 'ata-tour-text', text: '收到订单、送货单、价格表时，不用再自己翻表格一格格填：拖进来，AI 识别内容、找到对应的表、填好，改完按原格式导出 Excel。' });
+    const flow = card.createDiv('ata-tour-flow');
+    [['folder-down', '导入表格'], ['inbox', '丢进单据'], ['sparkles', 'AI 填表'], ['check', '确认修改'], ['download', '导出 Excel']].forEach(([ic, tx], i) => {
+      if (i) flow.createSpan({ cls: 'ata-tour-arrow', text: '→' });
+      const c = flow.createDiv('ata-tour-flowitem');
+      setIcon(c.createDiv('ata-tour-flowicon'), ic);
+      c.createSpan({ text: tx });
+    });
+    const box = card.createDiv('ata-tour-setup');
+    box.createDiv({ cls: 'ata-tour-sub', text: '先连上 AI（只需要一次）' });
+    const row1 = box.createDiv('ata-tour-row');
+    row1.createSpan({ text: 'AI 服务' });
+    const sel = row1.createEl('select', { cls: 'dropdown' });
+    Object.keys(PROVIDER_DEFAULTS).forEach((k) => sel.createEl('option', { attr: { value: k }, text: PROVIDER_DEFAULTS[k].label }));
+    sel.value = providerOf(s);
+    const row2 = box.createDiv('ata-tour-row');
+    row2.createSpan({ text: 'API Key' });
+    const key = row2.createEl('input', { attr: { type: 'password', placeholder: s.apiKey ? '已填写（不改就留空）' : '粘贴你的 API Key' } });
+    const hint = box.createDiv({ cls: 'ata-tour-hint' });
+    const setHint = () => hint.setText(sel.value === 'deepseek' ? 'DeepSeek 在 platform.deepseek.com 注册后创建 API Key，价格便宜，能识别图片。'
+      : sel.value === 'anthropic' ? 'Claude 在 console.anthropic.com 创建 API Key，识别图片和 PDF 效果最好。'
+        : '通义千问、Kimi、豆包等兼容 OpenAI 接口的服务，接口地址和模型可以之后在设置里填。');
+    setHint();
+    sel.addEventListener('change', setHint);
+    if (s.apiKey) box.createDiv({ cls: 'ata-tour-ok', text: `✓ 已经配置好 ${PROVIDER_DEFAULTS[providerOf(s)].label}，可以直接开始` });
+    box.createDiv({ cls: 'ata-tour-hint', text: 'Key 只保存在你自己的库里。现在不填也可以，之后在「设置」里填。' });
+    const saveAi = async () => {
+      if (sel.value !== providerOf(s)) { s.provider = sel.value; s.baseUrl = ''; s.model = ''; }
+      if (key.value.trim()) s.apiKey = key.value.trim();
+      await this.plugin.saveSettings();
+    };
+    const bar = card.createDiv('ata-tour-bar');
+    const skip = bar.createEl('button', { cls: 'ata-tour-skip', text: '跳过，我自己摸索' });
+    skip.addEventListener('click', async () => { await saveAi(); this.endTour(true); });
+    const go = bar.createDiv('ata-tour-btns').createEl('button', { cls: 'mod-cta', text: '开始 1 分钟导览 →' });
+    go.addEventListener('click', async () => { await saveAi(); this.tourGo(1); });
+  }
+
+  tourDone(card) {
+    card.addClass('is-wide');
+    card.createDiv({ cls: 'ata-tour-title big', text: '可以开始了 🎉' });
+    card.createDiv({ cls: 'ata-tour-text', text: '建议先导入一张你平时要填的表，然后把一张单据截图拖进来试试。也可以先用示例表练练手：' });
+    const ul = card.createEl('ul', { cls: 'ata-tour-list' });
+    ['示例表里已经有两条送货记录', '对话框里填好了一句示例指令，直接点发送', 'AI 会新增一行并标成绿色，点「应用」就写进表里'].forEach((x) => ul.createEl('li', { text: x }));
+    card.createDiv({ cls: 'ata-tour-hint', text: '以后想再看这个引导：点顶部的「引导」按钮，或在插件设置里点「重新查看使用引导」。' });
+    const bar = card.createDiv('ata-tour-bar');
+    const sp = bar.createDiv('ata-tour-btns');
+    const demo = sp.createEl('button', { text: '用示例表试试' });
+    demo.addEventListener('click', async () => { this.endTour(true); await this.createDemoTable(); });
+    const done = sp.createEl('button', { cls: 'mod-cta', text: '完成' });
+    done.addEventListener('click', () => this.endTour(true));
+    setTimeout(() => done.focus(), 30);
+  }
+
+  async createDemoTable() {
+    const d = new Date(), z = (n) => String(n).padStart(2, '0');
+    const day = (k) => { const x = new Date(d.getTime() - k * 86400000); return `${x.getFullYear()}-${z(x.getMonth() + 1)}-${z(x.getDate())}`; };
+    const t = { headers: ['日期', '客户', '品名', '规格', '数量(米)', '单价', '金额'], rows: [
+      [day(2), '华盛布行', '棉布', '280克', '120', '8.5', '1020'],
+      [day(1), '东方纺织', '涤纶布', '200克', '300', '6.2', '1860'],
+    ] };
+    try {
+      await this.ensureFolder(this.settings.folder);
+      const path = await this.uniquePath(this.settings.folder, '示例-送货记录', 'csv');
+      const file = await this.app.vault.create(path, toCSV(t));
+      this.logOp({ type: 'create', path: file.path, text: '新建示例表（新手引导）' });
+      const ask = `帮我加一条：${day(0)} 华盛布行 又送了棉布 280克 200米，单价 8.5，金额算一下`;
+      this.pendingPrompt = ask;
+      await this.openTable(file);
+      setTimeout(() => { /* 新建文件会触发一次重绘，等它画完再把示例指令填进去 */
+        if (this.inputEl && this.inputEl.isConnected && !this.inputEl.value.trim()) { this.inputEl.value = ask; this.inputEl.focus(); }
+        this.pendingPrompt = null;
+      }, 600);
+      new Notice('示例表已经建好，直接点发送试试。');
+    } catch (e) { new Notice('创建示例表失败：' + (e.message || e)); }
+  }
+
+  endTour(done) {
+    if (this.tourKey) document.removeEventListener('keydown', this.tourKey, true);
+    if (this.tourResize) window.removeEventListener('resize', this.tourResize);
+    this.tourKey = this.tourResize = null;
+    if (this.tourEl) { this.tourEl.remove(); this.tourEl = null; }
+    if (done && !this.settings.onboarded) { this.settings.onboarded = true; this.plugin.saveSettings(); }
+    if (done && this.tab === 'archive' && this.tourIdx > 0) { this.tab = 'home'; this.render(); }
   }
 
   hasFiles(e) {
@@ -2620,6 +2836,7 @@ class TableWorkbenchView extends ItemView {
     top('folder-up', '导入文件夹', () => this.folderInput.click());
     top('clipboard-paste', '按路径', () => new PathModal(this.app, this).open());
     top('file-plus', '新建', () => new NewTableModal(this.app, (n, c, f) => this.createTable(n, c, f)).open());
+    top('help-circle', '引导', () => this.startTour());
     top('settings', '设置', () => {
       this.app.setting.open();
       this.app.setting.openTabById(this.plugin.manifest.id);
@@ -3068,7 +3285,7 @@ class TableWorkbenchView extends ItemView {
     this.undoBtn.disabled = !this.undoStack.length;
     this.btn(right, '原文件', 'file-input', () => this.app.workspace.getLeaf('tab').openFile(this.file));
     this.btn(right, '删除', 'trash-2', () => this.confirmDelete(this.file), 'is-danger');
-    this.btn(right, '导出', 'download', () => this.exportDialog(), 'mod-cta');
+    this.btn(right, '导出', 'download', () => this.exportDialog(), 'mod-cta ata-export-btn');
 
     const ws = this.wsEl = body.createDiv('ata-ws');
     requestAnimationFrame(() => this.fitWorkspace());
@@ -4804,6 +5021,12 @@ class AITableSettingTab extends PluginSettingTab {
     containerEl.empty();
     const def = PROVIDER_DEFAULTS[providerOf(s)];
 
+    new Setting(containerEl).setName('使用引导').setDesc('一步步介绍每个功能怎么用。')
+      .addButton((b) => b.setButtonText('重新查看使用引导').onClick(async () => {
+        this.app.setting.close();
+        const v = await this.plugin.activateView();
+        if (v) v.startTour();
+      }));
     new Setting(containerEl).setName('AI 服务').setDesc('DeepSeek：在 platform.deepseek.com 申请 API Key；deepseek-flash 能看图片，带图片 / PDF 时插件会自动用它。「OpenAI 兼容」可接通义千问、Kimi、豆包等提供兼容接口的服务。')
       .addDropdown((d) => {
         Object.keys(PROVIDER_DEFAULTS).forEach((k) => d.addOption(k, PROVIDER_DEFAULTS[k].label));
@@ -4850,6 +5073,7 @@ class AITableAssistantPlugin extends Plugin {
     this.registerView(VIEW_TYPE, (leaf) => new TableWorkbenchView(leaf, this));
     this.addRibbonIcon('table', '表格工作台', () => this.activateView());
     this.addCommand({ id: 'open-panel', name: '打开表格工作台', callback: () => this.activateView() });
+    this.addCommand({ id: 'tour', name: '查看使用引导', callback: () => this.activateView().then((v) => v && v.startTour()) });
     this.addCommand({ id: 'quick-switch', name: '快速切换表格', callback: () => this.activateView().then((v) => v && v.quickSwitch()) });
     this.addCommand({
       id: 'use-active-file',

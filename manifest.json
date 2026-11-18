@@ -1,7 +1,7 @@
 {
   "id": "ai-table-assistant",
   "name": "AI 表格助手",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "minAppVersion": "1.4.0",
   "description": "表格工作台：拿到单据就拖进来自动推荐要填的表；多工作表 Excel 分组管理、下方标签切换、显示原表颜色、改完按原格式（颜色/公式/图片）整本导出；支持 Claude、DeepSeek 等 AI。",
   "author": "Unclesam-13",

@@ -15,6 +15,10 @@ const OBSOLETE_SETTINGS = ['provider', 'apiKey', 'baseUrl', 'model', 'maxRows', 
 
 const OLD_FOLDER = 'AI表格助手';
 const AUTO_DIR = '自动处理';
+const DATA_DIR = '数据';
+const OUT_DIR = '表格';
+/* 插件在表格文件夹根目录生成的说明文件（不是表格） */
+const DOC_FILES = ['操作守则.md', '数据目录.md', '操作日志.md'];
 const DEFAULT_FOLDER = '表格工作台';
 const DEFAULT_SETTINGS = {
   folder: DEFAULT_FOLDER,
@@ -1967,6 +1971,8 @@ class TableWorkbenchView extends ItemView {
     const zoneOf = (e) => {
       const el = e.target && e.target.closest ? e.target : null;
       if (!el) return null;
+      const fdz = el.closest('[data-drop-folder]');
+      if (fdz) return 'folder:' + fdz.getAttribute('data-drop-folder');
       if (el.closest('.ata-archive')) return 'archive';
       if (el.closest('.ata-aipanel')) return 'ai';
       const card = el.closest('[data-drop-table]');
@@ -2001,7 +2007,7 @@ class TableWorkbenchView extends ItemView {
       const z = zoneOf(e);
       this.root.toggleClass('ata-over-master', z === 'inbox');
       this.root.toggleClass('ata-over-chat', z === 'ai');
-      const card = e.target && e.target.closest ? e.target.closest('[data-drop-table]') : null;
+      const card = e.target && e.target.closest ? e.target.closest('[data-drop-table],[data-drop-folder]') : null;
       if (card !== this.overCard) {
         if (this.overCard) this.overCard.removeClass('is-drop-over');
         if (card) card.addClass('is-drop-over');
@@ -2117,37 +2123,34 @@ class TableWorkbenchView extends ItemView {
     setTimeout(async () => {
       try { await this.scanExternal(); } catch (e) { console.warn('[表格工作台] 检查外部修改失败', e); this.snapReady = true; }
       try { await this.removeOldGuides(); } catch (e) { /* 不影响使用 */ }
+      try { await this.moveIntoData(); } catch (e) { console.warn('[表格工作台] 搬进数据文件夹失败', e); }
       if (this.settings.autoProcess !== false) {
         try { await this.ensureAutoDirs(); this.scanAuto(); } catch (e) { console.warn('[表格工作台] 准备自动处理文件夹失败', e); }
       }
+      try { await this.writeRules(); await this.writeDataIndex(); await this.writeLogFile(); } catch (e) { console.warn('[表格工作台] 写说明文件失败', e); }
+      this.checkOutputs();
     }, 300);
   }
 
   /* ================= 新手引导 ================= */
   tourSteps() {
     const toTab = (t) => async () => { if (this.tab !== t) { this.tab = t; await this.render(); } };
-    const ws = async () => { if (this.file) await toTab('workspace')(); };
     return [
       { kind: 'welcome' },
-      { sel: '.ata-tabs', title: '四个页面', before: toTab('home'),
-        text: '「首页」看最近的操作记录；「表格库」放所有表格（多工作表的 Excel 会归在一起）；「工作区」打开一张表查看和修改；「附件区」存收到的单据、截图、PDF。' },
-      { sel: '.ata-top-actions', title: '第一步：导入你的表格', before: toTab('home'),
-        text: '点「导入文件」或「导入文件夹」，把平时用的 Excel / CSV 导进来。从微信拖不进来时，复制文件后在这里按 Ctrl+V，或点「按路径」。' },
-      { sel: '.ata-homestrip .ata-inbox', title: '收到的单据存这里', before: toTab('home'),
-        text: '订单、送货单、价格表的截图或 PDF 拖到这里（或点一下选择），会存进附件区，按月份归档。' },
-      { sel: '.ata-qstrip', title: '常用表一键切换', before: toTab('home'), optional: true,
-        text: '最近用过和设为常用的表排在这里，点一下就切过去。' },
-      { sel: '.ata-oplog', title: '操作记录', before: toTab('home'),
-        text: '导入、修改、导出、删除都按时间记在这里。表格文件被其它程序改过，也会记下改了哪些格子，可以确认或撤销。' },
-      { sel: '.ata-tablepane', title: '和原 Excel 一样显示', before: ws, needs: () => !!this.file,
-        alt: { sel: '.ata-tabs', text: '打开一张从 Excel 导入的表，会按原 Excel 的样子显示：标题行、合并单元格、列宽、颜色、边框都一样。' },
-        text: '从 Excel 导入的表按原样显示：标题行、合并单元格、列宽行高、颜色、边框、数字格式都和 Excel 一样，底部可以切换工作表。点格子查看内容，双击就能修改。' },
-      { sel: '.ata-tablefoot .ata-seg', title: '原表样式 / 编辑数据', before: ws, needs: () => !!this.file && !!this.link, optional: true,
-        text: '「原表样式」用来看；「编辑数据」是一张简洁的表格，可以直接改格子、加行加列。两种视图看的是同一份数据。' },
-      { sel: '.ata-export-btn', title: '导出成 Excel', before: ws, needs: () => !!this.file,
-        text: '改好后点「导出」。从 Excel 导入的表会按原文件的格式导出：颜色、公式、合并单元格、图片都保留，多个工作表一起导出成一个文件。' },
-      { sel: '.ata-archive-drop', title: '附件区', before: toTab('archive'),
-        text: '收到的文件都存在这里，图片和 PDF 有预览，图片能一键复制，也能用默认程序打开。' },
+      { sel: '.ata-tabs', title: '三个页面', before: toTab('home'),
+        text: '「日志」记录每一次操作；「文件管理」管理所有表格文件；「附件区」存单据、截图、PDF。修改表格交给外部 AI，这里负责存放、展示和记录。' },
+      { sel: '.ata-top-actions', title: '导入表格', before: toTab('home'),
+        text: '点「导入文件」或「导入文件夹」把 Excel / CSV 导进来，也可以直接拖进面板。导入时自动转换成 AI 能快速读写的底层数据（「数据」文件夹），同时生成一份原表 Excel（「表格」文件夹）。' },
+      { sel: '.ata-oplog', title: '日志', before: toTab('home'),
+        text: 'AI 改了哪张表、哪些格子从什么改成什么、加了哪些行、原表是否已更新，都按时间记在这里；改错了可以点「撤销这次修改」。AI 写的处理说明也会出现在这里。' },
+      { sel: '.ata-header-right', title: '操作守则', before: toTab('home'),
+        text: '「操作守则」是写给 AI 看的规则：文件放在哪、怎么改、改完怎么记录。让 AI 干活前先叫它读这份守则（点「复制守则地址」发给它）。' },
+      { sel: '.ata-fmlist', title: '文件管理', before: toTab('library'), optional: true,
+        alt: { sel: '.ata-tabs', text: '导入表格后，「文件管理」里会列出每个表格文件：勾选后可以复制原表地址、复制数据地址、删除，也能看到原表 Excel 是不是最新的。' },
+        text: '每个表格文件一行：勾选后可以批量复制原表地址、复制底层数据地址、删除；右边能看到原表 Excel 是不是已经更新到最新。点多工作表的 Excel 可以展开看每张表。' },
+      { sel: '.ata-folderbar', title: '附件区', before: toTab('archive'), optional: true,
+        alt: { sel: '.ata-tabs', text: '「附件区」存收到的文件，可以新建文件夹分类，多选后批量复制文件或路径。' },
+        text: '收到的文件存在这里。可以新建文件夹分类，点「多选」后批量复制文件（直接粘贴到微信）、复制路径、移动到文件夹。' },
       { kind: 'done' },
     ];
   }
@@ -2258,39 +2261,35 @@ class TableWorkbenchView extends ItemView {
   tourWelcome(card) {
     card.addClass('is-wide');
     card.createDiv({ cls: 'ata-tour-title big', text: '欢迎使用表格工作台 👋' });
-    card.createDiv({ cls: 'ata-tour-text', text: '在 Obsidian 里集中存放、查看和整理你的表格：Excel 导入后按原样显示，可以随手修改，最后按原格式导出；收到的单据、截图也有地方归档。' });
+    card.createDiv({ cls: 'ata-tour-text', text: '这里负责存放、展示和记录；改表格、算数交给你自己的 AI（能读写电脑文件的那种）。导入的 Excel 会转换成 AI 能快速读写的底层数据，AI 改完后自动生成新的原表 Excel，覆盖上一版。' });
     const flow = card.createDiv('ata-tour-flow');
-    [['folder-down', '导入表格'], ['sheet', '按原样查看'], ['pencil', '修改'], ['archive', '归档单据'], ['download', '导出 Excel']].forEach(([ic, tx], i) => {
+    [['folder-down', '导入 Excel'], ['database', '转成底层数据'], ['bot', 'AI 读写数据'], ['file-spreadsheet', '自动生成原表'], ['scroll-text', '记录日志']].forEach(([ic, tx], i) => {
       if (i) flow.createSpan({ cls: 'ata-tour-arrow', text: '→' });
       const c = flow.createDiv('ata-tour-flowitem');
       setIcon(c.createDiv('ata-tour-flowicon'), ic);
       c.createSpan({ text: tx });
     });
     const box = card.createDiv('ata-tour-setup');
-    box.createDiv({ cls: 'ata-tour-sub', text: '表格存在哪里' });
-    const row = box.createDiv('ata-tour-row');
-    row.createSpan({ text: '表格文件夹' });
-    const path = this.absPath(normalizePath(this.settings.folder));
-    const pv = row.createEl('code', { cls: 'ata-tour-path', text: path });
-    pv.addEventListener('click', () => this.copyText(path, '文件夹路径'));
-    box.createDiv({ cls: 'ata-tour-hint', text: '每张表都是这个文件夹里的一个 CSV 文件，用别的程序改了也会在这里显示出来。换电脑时请把整个库连同隐藏的 .ata 文件夹一起复制。' });
+    box.createDiv({ cls: 'ata-tour-sub', text: '给 AI 的第一句话' });
+    const guide = this.absPath(normalizePath(`${this.settings.folder}/操作守则.md`));
+    const say = `请先阅读 ${guide}，以后按里面的规则帮我处理表格。`;
+    const pv = box.createEl('code', { cls: 'ata-tour-path', text: say });
+    pv.addEventListener('click', () => this.copyText(say, '这句话'));
+    box.createDiv({ cls: 'ata-tour-hint', text: '点上面这句话可以复制，发给你的 AI。之后直接跟它说要做什么就行，比如「把附件区里今天的送货单加进订单表」。' });
     const bar = card.createDiv('ata-tour-bar');
-    const skip = bar.createEl('button', { cls: 'ata-tour-skip', text: '跳过，我自己摸索' });
+    const skip = bar.createEl('button', { cls: 'ata-tour-skip', text: '跳过' });
     skip.addEventListener('click', () => this.endTour(true));
-    const go = bar.createDiv('ata-tour-btns').createEl('button', { cls: 'mod-cta', text: '开始 1 分钟导览 →' });
+    const go = bar.createDiv('ata-tour-btns').createEl('button', { cls: 'mod-cta', text: '看看三个页面 →' });
     go.addEventListener('click', () => this.tourGo(1));
   }
 
   tourDone(card) {
     card.addClass('is-wide');
     card.createDiv({ cls: 'ata-tour-title big', text: '可以开始了 🎉' });
-    card.createDiv({ cls: 'ata-tour-text', text: '建议先导入一张你平时用的 Excel，看看是不是和原来一样。也可以先用示例表练手。' });
+    card.createDiv({ cls: 'ata-tour-text', text: '先导入你平时用的 Excel，然后把「操作守则」发给 AI，让它试着加一行数据，回来看日志和原表。' });
     card.createDiv({ cls: 'ata-tour-hint', text: '以后想再看这个引导：点顶部的「引导」按钮，或在插件设置里点「重新查看使用引导」。' });
     const bar = card.createDiv('ata-tour-bar');
-    const sp = bar.createDiv('ata-tour-btns');
-    const demo = sp.createEl('button', { text: '用示例表试试' });
-    demo.addEventListener('click', async () => { this.endTour(true); await this.createDemoTable(); });
-    const done = sp.createEl('button', { cls: 'mod-cta', text: '完成' });
+    const done = bar.createDiv('ata-tour-btns').createEl('button', { cls: 'mod-cta', text: '完成' });
     done.addEventListener('click', () => this.endTour(true));
     setTimeout(() => done.focus(), 30);
   }
@@ -2460,17 +2459,17 @@ class TableWorkbenchView extends ItemView {
     const banner = this.root.createDiv('ata-drop-banner');
     setIcon(banner.createSpan('ata-icon'), 'folder-down');
     banner.createSpan({ text: '松开即可导入' });
-    banner.createSpan({ cls: 'ata-muted', text: this.tab === 'workspace' ? '拖到右侧对话区 = 作为当前表的附件；拖到上方表名标签 = 填进那张表；其它地方 = 帮你选表' : '拖到某张表的卡片上 = 直接填那张表；其它地方 = 帮你找该填的表；文件夹 = 导入表格库' });
+    banner.createSpan({ cls: 'ata-muted', text: this.tab === 'archive' ? '存进附件区' + (this.archFolder ? `「${this.archFolder}」` : '') : 'Excel / CSV = 导入表格；文件夹 = 整个导入；其它文件 = 存进附件区' });
 
     this.renderTopbar(lib);
     this.renderTabs(lib);
     const body = this.root.createDiv('ata-body');
     this.renderedTab = this.tab;
+    if (this.tab === 'workspace') this.tab = 'library';
     if (this.tab === 'library') this.renderLibrary(body, lib);
-    else if (this.tab === 'workspace') this.renderWorkspace(body);
     else if (this.tab === 'archive') this.renderArchive(body);
     else this.renderHome(body, lib);
-    if (this.tab !== 'workspace') this.root.scrollTop = scroll;
+    this.root.scrollTop = scroll;
   }
 
   ico(parent, name, cls) {
@@ -2498,11 +2497,13 @@ class TableWorkbenchView extends ItemView {
     const bar = this.root.createDiv('ata-topbar');
     const search = bar.createDiv('ata-search');
     this.ico(search, 'search', 'ata-search-icon');
-    const input = search.createEl('input', { cls: 'ata-search-input', attr: { type: 'text', placeholder: '搜索表格名称、列名、分类…（回车打开第一个）' } });
+    const input = search.createEl('input', { cls: 'ata-search-input', attr: { type: 'text', placeholder: '搜索表格名称、工作表、列名…（回车在文件管理里定位）' } });
     input.value = this.query;
     const drop = search.createDiv('ata-search-drop');
     const update = () => {
       this.query = input.value.trim();
+      const ql = this.query.toLowerCase();
+      this.root.querySelectorAll('.ata-fmrow[data-q]').forEach((r) => { r.style.display = !ql || r.dataset.q.includes(ql) ? '' : 'none'; });
       drop.empty();
       if (!this.query) { drop.removeClass('is-open'); return; }
       const hits = this.searchLib(lib, this.query).slice(0, 8);
@@ -2538,7 +2539,6 @@ class TableWorkbenchView extends ItemView {
     top('file-up', '导入文件', () => this.fileInput.click());
     top('folder-up', '导入文件夹', () => this.folderInput.click());
     top('clipboard-paste', '按路径', () => new PathModal(this.app, this).open());
-    top('file-plus', '新建', () => new NewTableModal(this.app, (n, c, f) => this.createTable(n, c, f)).open());
     top('help-circle', '引导', () => this.startTour());
     top('settings', '设置', () => {
       this.app.setting.open();
@@ -2562,58 +2562,14 @@ class TableWorkbenchView extends ItemView {
       if (count != null) b.createSpan({ cls: 'ata-tab-count', text: String(count) });
       b.addEventListener('click', () => { this.tab = id; this.render(); });
     };
-    tab('home', 'layout-dashboard', '首页');
-    tab('library', 'library', '表格库', lib.length);
-    tab('workspace', 'table-2', this.file ? '工作区 · ' + this.file.basename : '工作区');
+    tab('home', 'scroll-text', '日志');
+    tab('library', 'folder-tree', '文件管理', this.fmGroups(lib).length);
     tab('archive', 'archive', '附件区', this.archiveFiles().length);
-    if (this.importing) tabs.createDiv({ cls: 'ata-importing', text: this.importing });
   }
+
 
   /* ---------- 首页 ---------- */
-  renderHome(body, lib) {
-    const head = body.createDiv('ata-header');
-    const left = head.createDiv();
-    const title = left.createDiv('ata-title');
-    this.ico(title, 'table');
-    title.createSpan({ text: '表格工作台' });
-    const sp = this.splitLibrary(lib);
-    const weekAgo = Date.now() - 7 * 86400000;
-    left.createDiv({ cls: 'ata-sub', text: `${sp.singles.length + sp.books.length} 个表格${sp.books.length ? `（${sp.books.length} 个 Excel 工作簿）` : ''} · ${lib.reduce((a, t) => a + t.rows, 0).toLocaleString()} 行数据 · 本周改过 ${lib.filter((t) => t.mtime > weekAgo).length} 张 · 附件 ${this.archiveFiles().length} 个` });
-    const right = head.createDiv('ata-header-right');
-    this.btn(right, '新建表格', 'plus', () => new NewTableModal(this.app, (n, c, f) => this.createTable(n, c, f)).open(), 'mod-cta');
 
-    /* 两个小入口：收到单据 / 导入表格 */
-    const strip = body.createDiv('ata-homestrip');
-    const ib = strip.createDiv('ata-inbox ata-mini');
-    this.ico(ib, 'inbox', 'ata-dropzone-icon');
-    const t1 = ib.createDiv('ata-dropzone-text');
-    t1.createEl('b', { text: '收到单据 / 截图 / 价格表' });
-    t1.createSpan({ text: '拖到这里或点击，存进附件区，按月份归档' });
-    ib.addEventListener('click', () => this.attachInput.click());
-    const dz = strip.createDiv('ata-dropzone ata-mini');
-    this.ico(dz, 'folder-down', 'ata-dropzone-icon');
-    const t2 = dz.createDiv('ata-dropzone-text');
-    t2.createEl('b', { text: '导入表格到表格库' });
-    t2.createSpan({ text: '拖入文件或文件夹，或点击选择' });
-    dz.addEventListener('click', () => this.fileInput.click());
-
-    /* 常用和最近：一行小卡片，也可以把单据拖上去 */
-    const files = this.recentFiles(10);
-    if (files.length) {
-      const row = body.createDiv('ata-qstrip');
-      row.createSpan({ cls: 'ata-muted', text: '常用 / 最近：' });
-      files.forEach((f) => {
-        const m = (this.settings.meta || {})[f.path] || {};
-        const c = row.createEl('button', { cls: 'ata-qchip' + (this.file && this.file.path === f.path ? ' is-current' : ''), attr: { title: (m.workbook ? m.workbook + ' · ' : '') + f.path + '\n可以把单据拖到这里直接填这张表' } });
-        c.setAttribute('data-drop-table', f.path);
-        if (this.isPinned(f.path)) c.createSpan({ cls: 'ata-qchip-star', text: '★' });
-        c.createSpan({ text: m.sheet || f.basename });
-        c.addEventListener('click', () => this.openTable(f));
-      });
-    }
-
-    this.renderOpLog(body);
-  }
 
 
 
@@ -2684,104 +2640,7 @@ class TableWorkbenchView extends ItemView {
   }
 
   /* ---------- 表格库 ---------- */
-  renderLibrary(body, lib) {
-    const head = body.createDiv('ata-header');
-    const left = head.createDiv();
-    const title = left.createDiv('ata-title');
-    this.ico(title, 'library');
-    title.createSpan({ text: '全部表格' });
-    left.createDiv({ cls: 'ata-sub', text: '点击卡片进入工作区编辑；点分类标签可手动修改分类。' });
-    const right = head.createDiv('ata-header-right');
-    const seg = right.createDiv('ata-seg');
-    [['recent', '最近'], ['name', '名称'], ['rows', '行数']].forEach(([k, label]) => {
-      const b = seg.createEl('button', { cls: 'ata-seg-btn' + (this.libSort === k ? ' is-active' : ''), text: label });
-      b.addEventListener('click', () => { this.libSort = k; this.render(); });
-    });
-    this.btn(right, this.selectMode ? '完成' : '批量管理', this.selectMode ? 'check' : 'list-checks', () => {
-      this.selectMode = !this.selectMode;
-      this.selected = new Set();
-      this.render();
-    });
-    this.btn(right, '导入文件夹', 'folder-up', () => this.folderInput.click(), 'mod-cta');
 
-    if (!lib.length) {
-      this.renderDropzone(body);
-      return;
-    }
-
-    /* 多工作表的 Excel 单独成组，不和普通表格混在一起 */
-    const { books, singles } = this.splitLibrary(lib);
-    const allLib = lib;
-    lib = singles;
-
-    const counts = new Map();
-    lib.forEach((t) => counts.set(t.category || '未分类', (counts.get(t.category || '未分类') || 0) + 1));
-    const catbar = body.createDiv('ata-catbar');
-    const chip = (name, n) => {
-      const b = catbar.createEl('button', { cls: 'ata-catchip' + (this.libFilter === name ? ' is-active' : '') });
-      if (name !== '全部' && name !== '未分类') {
-        const d = b.createSpan('ata-dot');
-        d.style.setProperty('--pc', this.categoryColor(name));
-      }
-      b.createSpan({ text: name });
-      b.createSpan({ cls: 'ata-tab-count', text: String(n) });
-      b.addEventListener('click', () => { this.libFilter = name; this.render(); });
-    };
-    chip('全部', lib.length);
-    [...counts.entries()].filter(([k]) => k !== '未分类').sort((a, b) => b[1] - a[1]).forEach(([k, n]) => chip(k, n));
-    if (counts.has('未分类')) chip('未分类', counts.get('未分类'));
-    if (this.libFilter !== '全部' && !counts.has(this.libFilter)) this.libFilter = '全部';
-
-    let list = lib.filter((t) => this.libFilter === '全部' || (t.category || '未分类') === this.libFilter);
-    const bookList = books.filter((b) => this.libFilter === '全部' || b.sheets.some((t) => (t.category || '未分类') === this.libFilter));
-    if (this.selectMode) {
-      const sb = body.createDiv('ata-selbar');
-      this.selCountEl = sb.createSpan({ cls: 'ata-selcount', text: `已选 ${this.selected.size} 个` });
-      this.btn(sb, '全选当前列表', 'check-square', () => { list.forEach((t) => this.selected.add(t.file.path)); bookList.forEach((b) => b.sheets.forEach((t) => this.selected.add(t.file.path))); this.render(); }, 'ata-btn-sm');
-      this.btn(sb, '清空选择', 'square', () => { this.selected.clear(); this.render(); }, 'ata-btn-sm');
-      this.btn(sb, '设为常用', 'star', async () => {
-        const pin = this.settings.pinned || (this.settings.pinned = []);
-        this.selected.forEach((p) => { if (!pin.includes(p)) pin.push(p); });
-        await this.plugin.saveSettings();
-        this.render();
-      }, 'ata-btn-sm');
-      this.btn(sb, '删除所选', 'trash-2', () => {
-        const files = [...this.selected].map((p) => this.app.vault.getAbstractFileByPath(p)).filter((f) => f instanceof TFile);
-        if (!files.length) { new Notice('还没有选择表格。'); return; }
-        new ConfirmModal(this.app, `删除选中的 ${files.length} 个表格？`, files.slice(0, 8).map((f) => '• ' + f.path).join('\n') + (files.length > 8 ? `\n……共 ${files.length} 个` : '') + '\n会移到回收站，需要时可以恢复。',
-          [{ text: `删除 ${files.length} 个`, warning: true, onClick: () => this.deleteFiles(files) }]).open();
-      }, 'ata-btn-sm is-danger');
-    }
-    const sorters = {
-      recent: (a, b) => b.mtime - a.mtime,
-      name: (a, b) => a.file.basename.localeCompare(b.file.basename, 'zh-Hans-CN', { numeric: true }),
-      rows: (a, b) => b.rows - a.rows,
-    };
-    list = list.sort(sorters[this.libSort]);
-
-    if (bookList.length) {
-      const bs = body.createDiv('ata-section');
-      const bh = bs.createDiv('ata-section-head');
-      const bt = bh.createDiv('ata-section-title');
-      this.ico(bt, 'book-open');
-      bt.createSpan({ text: `Excel 工作簿（${bookList.length}）` });
-      bh.createDiv({ cls: 'ata-muted', text: '一个 Excel 里有多个工作表；点开后在表格下方切换工作表，改完可以按原格式整本导出' });
-      const bg = bs.createDiv('ata-grid');
-      const bsort = { recent: (a, b) => b.mtime - a.mtime, name: (a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN', { numeric: true }), rows: (a, b) => b.rows - a.rows };
-      bookList.sort(bsort[this.libSort]).forEach((b) => this.bookCard(bg, b));
-    }
-    const ss = body.createDiv('ata-section');
-    if (bookList.length) {
-      const sh = ss.createDiv('ata-section-head');
-      const st = sh.createDiv('ata-section-title');
-      this.ico(st, 'table');
-      st.createSpan({ text: `单独的表格（${list.length}）` });
-    }
-    const grid = ss.createDiv('ata-grid');
-    if (!list.length) grid.createDiv({ cls: 'ata-empty-sm', text: '没有单独的表格。' });
-    list.forEach((t) => this.card(grid, t));
-    void allLib;
-  }
 
   /** 把表格库分成「多工作表的 Excel」和「单独的表格」 */
   splitLibrary(lib) {
@@ -3052,6 +2911,7 @@ class TableWorkbenchView extends ItemView {
     await this.snapIndex();
     await this.loadOpLog();
     await this.flushSave();
+    try { await (this.outQ || Promise.resolve()); } catch (e) { /* 继续 */ }
     const mv = (p) => (typeof p === 'string' && (p === oldF || p.startsWith(oldF + '/')) ? newF + p.slice(oldF.length) : p);
     const remap = (o) => { const out = {}; Object.keys(o || {}).forEach((k) => { out[mv(k)] = o[k]; }); return out; };
     this.migrating = true;
@@ -3111,12 +2971,318 @@ class TableWorkbenchView extends ItemView {
     if (fixed) { await this.plugin.saveSettings(); new Notice(`已恢复 ${fixed} 张表和原 Excel 的对应关系。`); }
   }
 
+  /* ================= 数据（底层 CSV）与原表（自动生成的 Excel） ================= */
+  dataDir() { return normalizePath(this.settings.folder + '/' + DATA_DIR); }
+  outDir() { return normalizePath(this.settings.folder + '/' + OUT_DIR); }
+
+  /** 一张表所属的「文件」：Excel 工作簿（多张表）或单独一张表 */
+  groupFiles(file) {
+    const sibs = this.workbookSiblings(file);
+    return sibs.length ? sibs : [file];
+  }
+
+  /** 这张表（或它所在工作簿）对应的原表 Excel 放在哪：表格/ 下按数据/ 的目录结构 */
+  outPathOf(file) {
+    const data = this.dataDir() + '/';
+    const m = (this.settings.meta || {})[file.path] || {};
+    const book = m.workbook && this.workbookSiblings(file).length;
+    let rel = book ? (file.parent ? file.parent.path : '') : file.path.replace(/\.[^./]+$/, '');
+    if (rel.startsWith(data)) rel = rel.slice(data.length);
+    else rel = rel.split('/').pop() || file.basename;
+    return normalizePath(`${this.outDir()}/${rel}.xlsx`);
+  }
+
+  /** 改动后自动重新生成原表（防抖，排队，一次一个） */
+  scheduleOutput(file, delay) {
+    if (!(file instanceof TFile) || !this.isTableFile(file)) return;
+    if (!this.outTimers) this.outTimers = new Map();
+    if (!this.outState) this.outState = new Map();
+    const dest = this.outPathOf(file);
+    clearTimeout(this.outTimers.get(dest));
+    this.outState.set(dest, { status: 'pending', time: Date.now() });
+    this.outTimers.set(dest, setTimeout(() => {
+      this.outTimers.delete(dest);
+      this.outQ = (this.outQ || Promise.resolve()).then(() => this.writeOutput(file, dest, 0)).catch((e) => console.warn('[表格工作台] 生成原表失败', e));
+    }, delay == null ? 2500 : delay));
+    if (this.tab === 'library') this.scheduleRender();
+  }
+
+  async writeOutput(file, dest, attempt) {
+    const cur = this.app.vault.getAbstractFileByPath(file.path);
+    if (!(cur instanceof TFile)) { this.outState.delete(dest); return; }
+    file = cur;
+    const realDest = this.outPathOf(file);
+    if (realDest !== dest) { this.outState.delete(dest); dest = realDest; }
+    const meta = this.settings.meta || {};
+    const tm = meta[file.path] || {};
+    const sibs = this.workbookSiblings(file);
+    const opts = { quiet: true, silent: true, dest, nolog: true };
+    try {
+      await this.ensureFolder(dest.replace(/\/[^/]+$/, ''));
+      const linked = tm.link && (await this.app.vault.adapter.exists(`${this.ataDir()}/sources/${tm.link.id}.xlsx`));
+      let res;
+      if (linked) res = await this.exportLinked(file, sibs.length > 1 ? sibs : [file], opts);
+      else if (sibs.length > 1) res = await this.exportWorkbook(file, sibs, opts);
+      else {
+        const text = await this.app.vault.read(file);
+        const t = file.extension === 'md' ? ((findMdTable(text) || {}).table || { headers: [], rows: [] }) : gridToTable(parseCSV(text));
+        res = await this.exportTable(file, t, 'xlsx', opts);
+      }
+      this.outState.set(dest, { status: 'ok', time: Date.now() });
+      /* 不单独记一条，标在引起这次更新的那条记录上 */
+      const paths = new Set(this.groupFiles(file).map((x) => x.path));
+      const log = this.plugin.opLog || [];
+      for (let i = log.length - 1; i >= 0 && i >= log.length - 50; i--) {
+        const e = log[i];
+        if (Date.now() - e.t > 30 * 60000) break;
+        if (paths.has(e.path) && /^(ext|ext-new|undo|edit|row|col)$/.test(e.type)) { e.output = Date.now(); e.outFile = dest; break; }
+      }
+      this.saveOpLog();
+      this.scheduleDocs();
+    } catch (e) {
+      const msg = e.message || String(e);
+      const busy = /EBUSY|EPERM|locked|被占用|resource busy/i.test(msg);
+      if (attempt < 6) {
+        this.outState.set(dest, { status: busy ? 'busy' : 'pending', time: Date.now(), msg });
+        setTimeout(() => { this.outQ = this.outQ.then(() => this.writeOutput(file, dest, attempt + 1)); }, busy ? 20000 : 5000);
+      } else {
+        this.outState.set(dest, { status: 'error', time: Date.now(), msg });
+        this.logOp({ type: 'output', path: file.path, text: `原表更新失败：${busy ? '文件被 Excel 或其它程序打开着，关掉后点「立即更新原表」' : msg}`, error: true });
+      }
+    }
+    if (this.tab === 'library') this.scheduleRender();
+  }
+
+  /** 打开时检查：原表还没生成、或者比数据旧的，都重新生成 */
+  checkOutputs() {
+    const seen = new Set();
+    for (const f of this.tableFiles()) {
+      const dest = this.outPathOf(f);
+      if (seen.has(dest)) continue;
+      seen.add(dest);
+      const out = this.app.vault.getAbstractFileByPath(dest);
+      const newest = Math.max(...this.groupFiles(f).map((x) => x.stat.mtime));
+      if (!(out instanceof TFile) || out.stat.mtime + 1000 < newest) this.scheduleOutput(f, 1500 + seen.size * 200);
+    }
+  }
+
+  /** 把旧版本放在表格文件夹根目录的表搬进「数据」文件夹 */
+  async moveIntoData() {
+    const root = normalizePath(this.settings.folder), data = this.dataDir();
+    const skip = new Set([DATA_DIR, OUT_DIR, '附件区', '导出', AUTO_DIR]);
+    const tops = new Set();
+    this.app.vault.getFiles().forEach((f) => {
+      if (!f.path.startsWith(root + '/')) return;
+      const rest = f.path.slice(root.length + 1), seg = rest.split('/')[0];
+      if (skip.has(seg) || seg.startsWith('.')) return;
+      if (!rest.includes('/')) { if (f.extension === 'csv' || (f.extension === 'md' && this.isTableFile(f) && !DOC_FILES.includes(seg))) tops.add(seg); }
+      else if (f.extension === 'csv') tops.add(seg);
+    });
+    if (!tops.size) return 0;
+    await this.ensureFolder(data);
+    await this.snapIndex();
+    await this.loadOpLog();
+    await this.flushSave();
+    try { await (this.outQ || Promise.resolve()); } catch (e) { /* 继续 */ }
+    const pairs = [];
+    this.migrating = true;
+    try {
+      for (const seg of tops) {
+        const from = `${root}/${seg}`, to = `${data}/${seg}`;
+        const fo = this.app.vault.getAbstractFileByPath(from);
+        if (!fo || this.app.vault.getAbstractFileByPath(to)) continue;
+        await this.app.fileManager.renameFile(fo, to);
+        pairs.push([from, to]);
+      }
+    } finally { this.migrating = false; }
+    const mv = (p) => { if (typeof p !== 'string') return p; for (const [a, b] of pairs) if (p === a || p.startsWith(a + '/')) return b + p.slice(a.length); return p; };
+    await this.remapAll(mv);
+    if (pairs.length) new Notice(`已把 ${pairs.length} 个表格 / 工作簿搬进「${DATA_DIR}」文件夹，原表 Excel 会自动生成在「${OUT_DIR}」文件夹。`, 10000);
+    return pairs.length;
+  }
+
+  /** 文件搬家后，把所有记录里的路径跟着改 */
+  async remapAll(mv) {
+    const s = this.settings;
+    const remap = (o) => { const out = {}; Object.keys(o || {}).forEach((k) => { out[mv(k)] = o[k]; }); return out; };
+    s.meta = remap(s.meta);
+    s.archiveMeta = remap(s.archiveMeta);
+    s.pinned = (s.pinned || []).map(mv);
+    s.recent = (s.recent || []).map(mv);
+    s.lastTable = mv(s.lastTable);
+    s.master = mv(s.master);
+    if (this.snapIdx) this.snapIdx = remap(this.snapIdx);
+    if (this.snapText) this.snapText = new Map([...this.snapText].map(([k, v]) => [mv(k), v]));
+    if (this.hlMap) this.hlMap = new Map([...this.hlMap].map(([k, v]) => [mv(k), v]));
+    (this.plugin.opLog || []).forEach((e) => { e.path = mv(e.path); if (e.file) e.file = mv(e.file); if (e.hist) e.hist = mv(e.hist); });
+    this.stats = new Map();
+    if (this.file) { const f = this.app.vault.getAbstractFileByPath(mv(this.file.path)); this.file = f instanceof TFile ? f : null; }
+    await this.plugin.saveSettings();
+    this.saveSnapIndex();
+    this.saveOpLog();
+  }
+
+  /* ================= 给 AI 看的守则、数据目录、操作日志 ================= */
+  async writeDoc(name, text) {
+    const p = normalizePath(`${this.settings.folder}/${name}`);
+    const f = this.app.vault.getAbstractFileByPath(p);
+    try {
+      if (f instanceof TFile) { if ((await this.app.vault.read(f)).replace(/\r/g, '') !== text) await this.app.vault.modify(f, text); }
+      else { await this.ensureFolder(this.settings.folder); await this.app.vault.create(p, text); }
+    } catch (e) { console.warn('[表格工作台] 写文件失败', name, e); }
+  }
+
+  async writeRules() {
+    const root = normalizePath(this.settings.folder);
+    const abs = this.absPath(root);
+    const sep = abs.includes('\\') ? '\\' : '/';
+    const text = `<!-- 表格工作台自动生成，插件更新时会刷新，手动修改会被覆盖 -->
+# 操作守则（给处理这些表格的 AI 和程序看）
+
+这个文件夹由 Obsidian 的「表格工作台」插件管理。你（AI）负责按用户的指令读取、修改表格；插件负责把你改好的数据自动转换成原生 Excel，并记录每一次操作。**开始任何任务前，先读完这份守则。**
+
+## 1. 文件夹结构
+
+根目录：\`${abs}\`
+
+| 位置 | 是什么 | 你能不能改 |
+|---|---|---|
+| \`数据目录.md\` | 所有表格的清单：文件位置、列名、行数、样例 | 只读，先看它找表 |
+| \`数据${sep}\` | **表格的底层数据**，每个工作表一个 CSV 文件；多工作表的 Excel 是一个子文件夹 | **读写这里** |
+| \`表格${sep}\` | 自动生成的原生 Excel（和数据一一对应，保留原表的颜色、公式、合并单元格、图片） | 只读，不要改，会被覆盖 |
+| \`附件区${sep}\` | 用户存的单据、截图、PDF、价格表，按文件夹分类 | 只读 |
+| \`自动处理${sep}\` | 导入新 Excel、请求导出、写操作记录（见第 4、5 节） | 按说明使用 |
+| \`操作日志.md\` | 插件自动记录的所有操作，最新的在最上面 | 只读，可用来了解之前做过什么 |
+| \`.ata${sep}\` | 插件内部数据 | **不要读写** |
+
+## 2. 修改表格的方法
+
+1. 先看 \`数据目录.md\` 找到要改的表，确认列名。
+2. 直接修改 \`数据${sep}\` 里对应的 CSV 文件。**不要去改 \`表格${sep}\` 里的 Excel，也不要整本打开 Excel 文件**——那样又慢又容易丢格式。
+3. 大表不要整个读入：先读表头和最后几十行，需要查找时按关键字搜索。
+4. 修改保存后，插件会在几秒内自动把这个工作簿重新生成为 \`表格${sep}\` 里的原生 Excel，覆盖上一版，并写进 \`操作日志.md\`。
+
+## 3. CSV 的规则
+
+- UTF-8 编码；第一行是表头；字段里有逗号、引号或换行时用英文双引号包起来，内部的双引号写成两个 \`""\`。
+- **不要改表头**（列名、列的顺序），除非用户明确要求；需要新列时加在最后一列后面。
+- **新增的行加在表格末尾**；不要调整已有行的顺序；用户要求删除时才删行。
+- 只改需要改的格子，其它内容保持原样（包括空格子和原来的写法）。
+- 日期写成 \`YYYY-MM-DD\`（或照搬这一列已有的写法）；数字不要加千分位逗号和货币符号。
+- 需要计算的（金额 = 数量 × 单价、合计等）请自己算好再写进去：CSV 里没有公式，导出时原表里已有的公式会保留，新增行会沿用上一行的公式。
+- Markdown 笔记里的表格：只改表格部分，表格外的文字不要动。
+- **不要删除、改名或移动 \`数据${sep}\` 里的文件。** 需要新表时，在 \`数据${sep}\` 里新建一个 CSV（第一行写表头），插件会自动为它生成 Excel。
+
+## 4. 导入新的原始 Excel
+
+- 新表格：复制到 \`自动处理${sep}导入${sep}\`。
+- 拿到某个已导入表格的新版本、想用它替换旧的：复制到 \`自动处理${sep}导入${sep}替换${sep}\`（同名的旧表会进回收站）。
+- 等 \`自动处理${sep}导入${sep}已完成${sep}\` 里出现 \`原文件名.结果.txt\`，里面写着生成了哪些 CSV。
+- 支持 .xlsx / .xlsm / .csv / .tsv。老版 .xls 需要先另存为 .xlsx。
+
+## 5. 每次任务结束要写记录
+
+在 \`自动处理${sep}记录${sep}\` 新建一个 .txt 文件（文件名随意），第一行写一句话总结，后面写细节，例如：
+
+\`\`\`
+按 11 月 20 日送货单给「！！客户」加了 3 行
+- 新增：2026-11-20 华盛布行 棉布 280克 200米 单价 8.5 金额 1700
+- 依据：附件区/2026-11/送货单0001.jpg
+- 需要用户核对：第 2 行单价看不清，按 8.5 填写
+\`\`\`
+
+插件会把它收进 \`操作日志.md\` 和首页的日志里。表格的具体改动（哪一格从什么改成什么）插件会自动对比记录，不用你写。
+
+## 6. 需要马上拿到 Excel 时
+
+原表一般几秒内就会自动更新。如果要另存一份到指定位置，在 \`自动处理${sep}导出${sep}\` 新建 .txt，写：
+
+\`\`\`
+表格: 工作簿名或表名
+输出: 要另存的完整路径.xlsx
+\`\`\`
+
+结果写在 \`自动处理${sep}导出${sep}已完成${sep}请求文件名.结果.txt\`。
+
+## 7. 其它
+
+- 用户只让你「查」「看」「算一下告诉我」时，不要修改文件。
+- 改错了不用慌：用户可以在 Obsidian 里一键撤销任何一次修改。
+- 回复用户时说清楚：改了哪个表、新增 / 修改了哪几行、原表 Excel 在哪（\`表格${sep}…\`）、有哪些需要用户核对。
+`;
+    await this.writeDoc('操作守则.md', text);
+  }
+
+  scheduleDocs() {
+    clearTimeout(this.docTimer);
+    this.docTimer = setTimeout(() => { this.writeDataIndex().catch(() => {}); this.writeLogFile().catch(() => {}); }, 5000);
+  }
+
+  async writeDataIndex() {
+    const lib = await this.library();
+    const meta = this.settings.meta || {};
+    const sp = this.splitLibrary(lib);
+    const rel = (p) => p.slice(normalizePath(this.settings.folder).length + 1);
+    const lines = ['<!-- 表格工作台自动生成，表格有变化时自动更新，手动修改会被覆盖 -->', '# 数据目录', '',
+      `共 ${sp.books.length + sp.singles.length} 个表格文件（${sp.books.length} 个多工作表 Excel，${lib.length} 张表）。路径都相对于本文件所在的文件夹。修改请看「操作守则.md」。`, ''];
+    const tableLines = (t) => {
+      const m = meta[t.file.path] || {};
+      const d = new Date(t.mtime), z = (n) => String(n).padStart(2, '0');
+      lines.push(`- 底层数据：\`${rel(t.file.path)}\``);
+      lines.push(`- 列（${t.headers.length}）：${t.headers.join('、')}`);
+      lines.push(`- 行数：${t.rows}　最后修改：${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`);
+      if (m.title) lines.push(`- 表头上方的标题：${String(m.title).replace(/\n/g, ' ').slice(0, 80)}`);
+      if (t.sample && t.sample.length) lines.push(`- 样例：${t.headers.map((h, i) => `${h}=${cellStr(t.sample[0][i])}`).filter((x) => !/=$/.test(x)).slice(0, 12).join('；')}`);
+      lines.push('');
+    };
+    for (const b of sp.books) {
+      lines.push(`## ${b.name}（Excel 工作簿，${b.sheets.length} 张表）`, '');
+      lines.push(`原表：\`${rel(this.outPathOf(b.sheets[0].file))}\``, '');
+      for (const t of b.sheets) { lines.push(`### ${(meta[t.file.path] || {}).sheet || t.file.basename}`); tableLines(t); }
+    }
+    if (sp.singles.length) {
+      lines.push('## 单独的表格', '');
+      for (const t of sp.singles) { lines.push(`### ${t.file.basename}`); lines.push(`- 原表：\`${rel(this.outPathOf(t.file))}\``); tableLines(t); }
+    }
+    await this.writeDoc('数据目录.md', lines.join('\n'));
+  }
+
+  async writeLogFile() {
+    const list = (await this.loadOpLog()).slice(-400).reverse();
+    const NAME = { ext: '修改', 'ext-new': '新建表格', 'ext-del': '删除表格', output: '原表更新', note: '记录', import: '导入', export: '导出', create: '新建', delete: '删除', archive: '附件', undo: '撤销', edit: '手动修改', row: '行', col: '列', ai: '旧版' };
+    const z = (n) => String(n).padStart(2, '0');
+    const lines = ['<!-- 表格工作台自动生成，最新的在最上面，手动修改会被覆盖 -->', '# 操作日志', ''];
+    let day = '';
+    for (const e of list) {
+      const d = new Date(e.t);
+      const ds = `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`;
+      if (ds !== day) { day = ds; lines.push(`## ${ds}`, ''); }
+      lines.push(`- ${z(d.getHours())}:${z(d.getMinutes())} 【${NAME[e.type] || e.type}】${e.name ? e.name + '：' : ''}${e.text || ''}${e.review === 'undone' ? '（已撤销）' : ''}${e.output && e.outFile ? `（原表已更新：${e.outFile.slice(normalizePath(this.settings.folder).length + 1)}）` : ''}`);
+      if (e.type === 'ext') {
+        (e.cells || []).slice(0, 8).forEach((c) => lines.push(`  - 第 ${c.r} 行「${c.h}」：${c.o || '（空）'} → ${c.n || '（空）'}`));
+        if ((e.cellsN || 0) > 8) lines.push(`  - ……共 ${e.cellsN} 个格子`);
+        (e.added || []).slice(0, 5).forEach((r) => lines.push(`  - 新增：${(e.hdr || []).map((h, i) => (r[i] ? `${h}=${r[i]}` : '')).filter(Boolean).slice(0, 10).join('；')}`));
+        if ((e.addedN || 0) > 5) lines.push(`  - ……共新增 ${e.addedN} 行`);
+      }
+      if (e.type === 'note' && e.items) e.items.slice(0, 20).forEach((x) => lines.push(`  ${x.startsWith('-') ? x : '- ' + x}`));
+    }
+    await this.writeDoc('操作日志.md', lines.join('\n'));
+  }
+
+  /** 「自动处理/记录」里的说明文件，收进日志 */
+  async autoNote(tf) {
+    const text = (await this.app.vault.read(tf)).replace(/\r/g, '');
+    const ls = text.split('\n').map((x) => x.trimEnd()).filter((x) => x.trim());
+    if (ls.length) this.logOp({ type: 'note', text: ls[0].replace(/^#+\s*/, ''), items: ls.slice(1, 60) });
+    await this.moveDone(tf, this.autoDir() + '/记录/已记录');
+  }
+
   /* ================= 自动处理：放文件即导入、放请求即导出、链接调用 ================= */
   autoDir() { return normalizePath(this.settings.folder + '/' + AUTO_DIR); }
 
   async ensureAutoDirs() {
     const d = this.autoDir();
-    for (const sub of ['', '/导入', '/导入/替换', '/导入/已完成', '/导出', '/导出/已完成']) await this.ensureFolder(d + sub);
+    for (const sub of ['', '/导入', '/导入/替换', '/导入/已完成', '/导出', '/导出/已完成', '/记录', '/记录/已记录']) await this.ensureFolder(d + sub);
     const help = `${d}/使用说明.md`;
     const f = this.app.vault.getAbstractFileByPath(help);
     const text = this.autoHelpText();
@@ -3220,7 +3386,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
   async removeImported(fileName) {
     const book = baseName(fileName);
     const meta = this.settings.meta || {};
-    const root = normalizePath(this.settings.folder);
+    const root = this.dataDir();
     const old = this.tableFiles().filter((f) => (meta[f.path] && meta[f.path].workbook === book) || f.path === `${root}/${book}.csv`);
     if (old.length) {
       await this.deleteFiles(old);
@@ -3322,7 +3488,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
         last = cur.stat.size;
         await new Promise((r) => setTimeout(r, 700));
       }
-      try { if (kind === 'import') await this.autoImport(tf); else await this.autoExport(tf); }
+      try { if (kind === 'import') await this.autoImport(tf); else if (kind === 'note') await this.autoNote(tf); else await this.autoExport(tf); }
       catch (e) { console.warn('[表格工作台] 自动处理失败', e); new Notice('自动处理失败：' + (e.message || e)); }
     }).finally(() => this.autoSeen.delete(tf.path));
   }
@@ -3333,6 +3499,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     if (/\.结果\.txt$/.test(f.name) || f.name === '使用说明.md' || f.name === '最近一次结果.txt') return null;
     if (f.path.startsWith(d + '/导入/') && !f.path.startsWith(d + '/导入/已完成/') && TABLE_EXT.test(f.name) && !f.name.startsWith('~$')) return 'import';
     if (f.path.startsWith(d + '/导出/') && !f.path.startsWith(d + '/导出/已完成/') && /\.(txt|json|md)$/i.test(f.name)) return 'export';
+    if (f.path.startsWith(d + '/记录/') && !f.path.startsWith(d + '/记录/已记录/') && /\.(txt|md)$/i.test(f.name)) return 'note';
     return null;
   }
 
@@ -3371,6 +3538,262 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     }
     await this.ensureFolder(this.autoDir());
     await this.writeResult(`${this.autoDir()}/最近一次结果.txt`, lines);
+  }
+
+  /* ================= 文件管理 ================= */
+  fmGroups(lib) {
+    const sp = this.splitLibrary(lib);
+    const meta = this.settings.meta || {};
+    const groups = [];
+    sp.books.forEach((b) => groups.push({ key: b.key, name: b.name, book: true, files: b.sheets.map((t) => t.file), stats: b.sheets, rows: b.rows, mtime: b.mtime, folder: b.folder }));
+    sp.singles.forEach((t) => groups.push({ key: t.file.path, name: (meta[t.file.path] || {}).sheet || t.file.basename, book: false, files: [t.file], stats: [t], rows: t.rows, mtime: t.mtime }));
+    groups.forEach((g) => {
+      g.out = this.outPathOf(g.files[0]);
+      g.linked = !!((meta[g.files[0].path] || {}).link);
+      g.dataPath = g.book ? g.folder : g.files[0].path;
+    });
+    return groups;
+  }
+
+  async copyPaths(paths, what) {
+    const text = paths.map((p) => this.absPath(p)).join('\n');
+    await this.copyText(text, `${paths.length > 1 ? ` ${paths.length} 个` : ''}${what || '地址'}`);
+  }
+
+  /** 把文件本身复制到剪贴板（可以直接粘贴到微信、资源管理器）。Windows 支持多个文件，其它系统复制路径 */
+  async copyFiles(paths) {
+    const abs = paths.map((p) => this.absPath(p));
+    const cp = nodeReq('child_process');
+    const isWin = typeof process !== 'undefined' && process.platform === 'win32';
+    const isMac = typeof process !== 'undefined' && process.platform === 'darwin';
+    try {
+      if (cp && isWin) {
+        const list = abs.map((p) => `'${p.replace(/'/g, "''")}'`).join(',');
+        await new Promise((res, rej) => cp.execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Set-Clipboard -Path ${list}`], { windowsHide: true }, (err) => (err ? rej(err) : res())));
+        new Notice(`已复制 ${abs.length} 个文件，可以直接粘贴到微信或文件夹里。`);
+        return;
+      }
+      if (cp && isMac && abs.length === 1) {
+        await new Promise((res, rej) => cp.execFile('osascript', ['-e', `set the clipboard to (POSIX file "${abs[0].replace(/"/g, '\\"')}")`], (err) => (err ? rej(err) : res())));
+        new Notice('已复制文件，可以直接粘贴。');
+        return;
+      }
+    } catch (e) { console.warn('[表格工作台] 复制文件失败', e); }
+    if (abs.length === 1 && /\.(png|jpe?g|webp|gif|bmp)$/i.test(abs[0])) {
+      const tf = this.app.vault.getAbstractFileByPath(paths[0]);
+      if (tf instanceof TFile) { await copyImageNotice(this.app, tf); return; }
+    }
+    await this.copyText(abs.join('\n'), `${abs.length} 个文件的路径（这台电脑不支持直接复制多个文件）`);
+  }
+
+  showInSystem(path) {
+    const abs = this.absPath(path);
+    try {
+      const { shell } = require('electron');
+      if (shell && shell.showItemInFolder) { shell.showItemInFolder(abs); return; }
+    } catch (e) { /* 不是桌面版 */ }
+    if (this.app.showInFolder) this.app.showInFolder(path);
+  }
+
+  async deleteGroups(groups) {
+    const files = groups.flatMap((g) => g.files);
+    const outs = groups.map((g) => this.app.vault.getAbstractFileByPath(g.out)).filter((f) => f instanceof TFile);
+    await this.deleteFiles(files);
+    for (const f of outs) {
+      try { if (this.app.fileManager && this.app.fileManager.trashFile) await this.app.fileManager.trashFile(f); else await this.app.vault.trash(f, true); } catch (e) { /* 已经没了 */ }
+    }
+    if (this.fmSel) groups.forEach((g) => this.fmSel.delete(g.key));
+    this.scheduleDocs();
+    await this.render();
+  }
+
+  renderLibrary(body, lib) {
+    const groups = this.fmGroups(lib);
+    if (!this.fmSel) this.fmSel = new Set();
+    if (!this.fmOpen) this.fmOpen = new Set();
+    const head = body.createDiv('ata-header');
+    const left = head.createDiv();
+    const title = left.createDiv('ata-title');
+    this.ico(title, 'folder-tree');
+    title.createSpan({ text: '文件管理' });
+    left.createDiv({ cls: 'ata-sub', text: `${groups.length} 个表格文件（${groups.filter((g) => g.book).length} 个多工作表 Excel，共 ${lib.length} 张表）· 原表 Excel 在「${OUT_DIR}」文件夹，底层数据在「${DATA_DIR}」文件夹，改了数据会自动更新原表` });
+    const right = head.createDiv('ata-header-right');
+    this.btn(right, '原表文件夹', 'folder-open', async () => { await this.ensureFolder(this.outDir()); this.showInSystem(this.outDir()); });
+    this.btn(right, '全部更新原表', 'refresh-cw', () => { const seen = new Set(); this.tableFiles().forEach((f, i) => { const d = this.outPathOf(f); if (!seen.has(d)) { seen.add(d); this.scheduleOutput(f, 300 + i * 50); } }); new Notice('已开始重新生成全部原表。'); });
+
+    if (!groups.length) { this.renderDropzone(body); return; }
+    const shown = groups.slice().sort((a, b) => b.mtime - a.mtime);
+    const selected = () => groups.filter((g) => this.fmSel.has(g.key));
+
+    const bar = body.createDiv('ata-fmbar');
+    const all = bar.createEl('input', { type: 'checkbox', cls: 'ata-fm-check' });
+    all.checked = shown.length > 0 && shown.every((g) => this.fmSel.has(g.key));
+    all.addEventListener('change', () => { shown.forEach((g) => (all.checked ? this.fmSel.add(g.key) : this.fmSel.delete(g.key))); this.render(); });
+    const n = selected().length;
+    bar.createSpan({ cls: 'ata-muted', text: n ? `已选 ${n} 个` : `${shown.length} 个 · 勾选后可以批量复制地址、删除` });
+    const acts = bar.createDiv('ata-fmbar-acts');
+    if (n) {
+      this.btn(acts, '复制原表地址', 'copy', () => this.copyPaths(selected().map((g) => g.out), '原表地址'), 'ata-btn-sm');
+      this.btn(acts, '复制数据地址', 'database', () => this.copyPaths(selected().map((g) => g.dataPath), '数据地址'), 'ata-btn-sm');
+      this.btn(acts, '复制原表文件', 'files', () => this.copyFiles(selected().map((g) => g.out).filter((p) => this.app.vault.getAbstractFileByPath(p))), 'ata-btn-sm');
+      this.btn(acts, '立即更新原表', 'refresh-cw', () => { selected().forEach((g, i) => this.scheduleOutput(g.files[0], 200 + i * 50)); }, 'ata-btn-sm');
+      this.btn(acts, '删除', 'trash-2', () => {
+        const s = selected();
+        new ConfirmModal(this.app, `删除 ${s.length} 个表格文件？`, s.slice(0, 10).map((g) => '• ' + g.name).join('\n') + '\n底层数据和原表 Excel 都会移到回收站，需要时可以恢复。', [{ text: `删除 ${s.length} 个`, warning: true, onClick: () => this.deleteGroups(s) }]).open();
+      }, 'ata-btn-sm is-danger');
+      this.btn(acts, '取消选择', 'x', () => { this.fmSel.clear(); this.render(); }, 'ata-btn-sm');
+    }
+
+    const list = body.createDiv('ata-fmlist');
+    const hdr = list.createDiv('ata-fmrow is-head');
+    ['', '名称', '类型', '行数', '数据更新', '原表 Excel', ''].forEach((x) => hdr.createDiv({ text: x }));
+    const now = Date.now();
+    for (const g of shown) {
+      const row = list.createDiv('ata-fmrow' + (this.fmSel.has(g.key) ? ' is-selected' : '') + (this.revealKey === g.key ? ' is-flash' : ''));
+      row.dataset.key = g.key;
+      row.dataset.q = [g.name, g.dataPath, ...g.stats.flatMap((t) => [t.file.basename, ...(t.headers || [])])].join(' ').toLowerCase();
+      const cb = row.createDiv().createEl('input', { type: 'checkbox', cls: 'ata-fm-check' });
+      cb.checked = this.fmSel.has(g.key);
+      cb.addEventListener('click', (e) => e.stopPropagation());
+      cb.addEventListener('change', () => { if (cb.checked) this.fmSel.add(g.key); else this.fmSel.delete(g.key); this.render(); });
+      const nm = row.createDiv('ata-fm-name');
+      const tw = nm.createSpan('ata-fm-twist');
+      setIcon(tw, g.book ? (this.fmOpen.has(g.key) ? 'chevron-down' : 'chevron-right') : 'dot');
+      this.ico(nm, g.book ? 'book-open' : 'sheet');
+      const nt = nm.createDiv('ata-fm-nt');
+      nt.createDiv({ cls: 'ata-fm-title', text: g.name, attr: { title: g.name } });
+      nt.createDiv({ cls: 'ata-fm-path', text: g.dataPath, attr: { title: this.absPath(g.dataPath) } });
+      row.createDiv({ cls: 'ata-fm-type', text: g.book ? `Excel · ${g.files.length} 张表` : g.linked ? 'Excel' : 'CSV 表' });
+      row.createDiv({ cls: 'ata-fm-num', text: g.rows.toLocaleString() });
+      row.createDiv({ cls: 'ata-fm-time', text: fmtTime(g.mtime) });
+      const oc = row.createDiv('ata-fm-out');
+      const of = this.app.vault.getAbstractFileByPath(g.out);
+      const st = this.outState && this.outState.get(g.out);
+      if (st && st.status === 'pending') oc.createSpan({ cls: 'ata-fm-st is-pending', text: '更新中…' });
+      else if (st && st.status === 'busy') oc.createSpan({ cls: 'ata-fm-st is-warn', text: '被占用，稍后重试', attr: { title: '原表 Excel 正被 Excel / WPS 打开，关掉后会自动更新' } });
+      else if (st && st.status === 'error') oc.createSpan({ cls: 'ata-fm-st is-err', text: '更新失败', attr: { title: st.msg || '' } });
+      else if (of instanceof TFile) oc.createSpan({ cls: 'ata-fm-st is-ok', text: '✓ ' + fmtTime(of.stat.mtime) + (of.stat.mtime + 1000 < g.mtime ? '（比数据旧）' : ''), attr: { title: this.absPath(g.out) } });
+      else oc.createSpan({ cls: 'ata-fm-st is-pending', text: '还没生成' });
+      const ac = row.createDiv('ata-fm-acts');
+      this.iconBtn(ac, 'copy', '复制原表地址', () => this.copyPaths([g.out], '原表地址'));
+      this.iconBtn(ac, 'database', '复制数据地址', () => this.copyPaths([g.dataPath], '数据地址'));
+      if (of instanceof TFile) {
+        this.iconBtn(ac, 'external-link', '用 Excel 打开原表', () => this.app.openWithDefaultApp && this.app.openWithDefaultApp(g.out));
+        this.iconBtn(ac, 'folder-open', '在文件夹中显示', () => this.showInSystem(g.out));
+      }
+      this.iconBtn(ac, 'trash-2', '删除', () => new ConfirmModal(this.app, `删除「${g.name}」？`, '底层数据和原表 Excel 都会移到回收站，需要时可以恢复。', [{ text: '删除', warning: true, onClick: () => this.deleteGroups([g]) }]).open()).addClass('is-danger');
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('button, input')) return;
+        if (g.book) { if (this.fmOpen.has(g.key)) this.fmOpen.delete(g.key); else this.fmOpen.add(g.key); this.render(); }
+        else { if (this.fmSel.has(g.key)) this.fmSel.delete(g.key); else this.fmSel.add(g.key); this.render(); }
+      });
+      if (g.book && this.fmOpen.has(g.key)) {
+        const sub = list.createDiv('ata-fmsub');
+        g.stats.forEach((t) => {
+          const m = (this.settings.meta || {})[t.file.path] || {};
+          const r = sub.createDiv('ata-fmsubrow');
+          this.ico(r, 'sheet');
+          r.createSpan({ cls: 'ata-fm-sheet', text: m.sheet || t.file.basename });
+          r.createSpan({ cls: 'ata-muted', text: `${t.rows.toLocaleString()} 行 · ${t.headers.length} 列 · ${t.headers.slice(0, 6).join('、')}${t.headers.length > 6 ? '…' : ''}` });
+          const a2 = r.createDiv('ata-fm-acts');
+          this.iconBtn(a2, 'database', '复制这张表的数据地址', () => this.copyPaths([t.file.path], '数据地址'));
+          this.iconBtn(a2, 'file-text', '在 Obsidian 里查看 CSV', () => this.app.workspace.getLeaf('tab').openFile(t.file));
+        });
+      }
+    }
+    if (this.query) { const ql = this.query.toLowerCase(); list.querySelectorAll('.ata-fmrow[data-q]').forEach((r) => { r.style.display = r.dataset.q.includes(ql) ? '' : 'none'; }); }
+    if (this.revealKey) {
+      const el = list.querySelector(`.ata-fmrow[data-key="${CSS.escape(this.revealKey)}"]`);
+      if (el) setTimeout(() => el.scrollIntoView({ block: 'center' }), 50);
+      setTimeout(() => { this.revealKey = null; }, 1500);
+    }
+  }
+
+  /** 以前「打开表格」的地方：现在跳到文件管理里定位这个文件 */
+  async openTable(file) {
+    if (!(file instanceof TFile)) return;
+    const g = this.fmGroups(await this.library()).find((x) => x.files.some((f) => f.path === file.path));
+    this.revealKey = g ? g.key : null;
+    if (g && g.book) { if (!this.fmOpen) this.fmOpen = new Set(); this.fmOpen.add(g.key); }
+    this.tab = 'library';
+    await this.render();
+  }
+
+  /* ================= 首页：日志 ================= */
+  renderHome(body) {
+    const head = body.createDiv('ata-header');
+    const left = head.createDiv();
+    const title = left.createDiv('ata-title');
+    this.ico(title, 'scroll-text');
+    title.createSpan({ text: '操作日志' });
+    left.createDiv({ cls: 'ata-sub', text: '每一次修改（改了哪些格子、加了哪些行）、原表 Excel 的自动更新、导入、删除、处理说明都记在这里，同时写进表格文件夹里的「操作日志.md」。' });
+    const right = head.createDiv('ata-header-right');
+    const openDoc = (name) => { const f = this.app.vault.getAbstractFileByPath(normalizePath(`${this.settings.folder}/${name}`)); if (f instanceof TFile) this.app.workspace.getLeaf('tab').openFile(f); else new Notice('还没生成，稍等几秒。'); };
+    this.btn(right, '操作守则', 'book-open-check', () => openDoc('操作守则.md'));
+    this.btn(right, '数据目录', 'list-tree', () => openDoc('数据目录.md'));
+    this.btn(right, '复制守则地址', 'copy', () => this.copyText(this.absPath(normalizePath(`${this.settings.folder}/操作守则.md`)), '操作守则的地址'));
+    this.renderOpLog(body);
+  }
+
+  /* ================= 附件区文件夹 ================= */
+  archiveFolders() {
+    const dir = this.archiveDir() + '/';
+    const set = new Set((this.settings.archiveFolders || []).filter(Boolean));
+    this.archiveFiles().forEach((f) => { const rel = f.path.slice(dir.length); if (rel.includes('/')) set.add(rel.slice(0, rel.lastIndexOf('/'))); });
+    return [...set].sort((a, b) => (/^\d{4}-\d{2}$/.test(a) === /^\d{4}-\d{2}$/.test(b) ? (/^\d{4}-\d{2}$/.test(a) ? b.localeCompare(a) : a.localeCompare(b, 'zh-Hans-CN')) : /^\d{4}-\d{2}$/.test(a) ? 1 : -1));
+  }
+
+  folderOf(tf) {
+    const rel = tf.path.slice(this.archiveDir().length + 1);
+    return rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+  }
+
+  async newArchiveFolder(then) {
+    new TextPromptModal(this.app, '新建附件文件夹（可以用 / 建子文件夹，例如：客户/华盛）', '', async (name) => {
+      name = normalizePath(String(name || '').split('/').map(safeSeg).filter(Boolean).join('/'));
+      if (!name) return;
+      await this.ensureFolder(`${this.archiveDir()}/${name}`);
+      const s = this.settings;
+      s.archiveFolders = [...new Set([...(s.archiveFolders || []), name])];
+      await this.plugin.saveSettings();
+      if (then) await then(name); else { this.archFolder = name; await this.render(); }
+    }).open();
+  }
+
+  async moveArchive(tfs, folder) {
+    const dest = folder ? `${this.archiveDir()}/${folder}` : this.archiveDir();
+    await this.ensureFolder(dest);
+    const am = this.settings.archiveMeta || {};
+    this.archiving = true;
+    let n = 0;
+    try {
+      for (const tf of tfs) {
+        if (this.folderOf(tf) === folder) continue;
+        const dot = tf.name.lastIndexOf('.');
+        const np = await this.uniquePath(dest, dot > 0 ? tf.name.slice(0, dot) : tf.name, dot > 0 ? tf.name.slice(dot + 1) : 'bin');
+        const old = tf.path;
+        await this.app.fileManager.renameFile(tf, np);
+        if (am[old]) { am[np] = am[old]; delete am[old]; }
+        n++;
+      }
+    } finally { this.archiving = false; }
+    await this.plugin.saveSettings();
+    this.logOp({ type: 'archive', text: `把 ${n} 个附件移到「${folder || '附件区'}」`, items: tfs.map((f) => f.name) });
+    if (this.archSel) this.archSel.clear();
+    new Notice(`已移动 ${n} 个文件到「${folder || '附件区'}」。`);
+    await this.render();
+  }
+
+  pickArchiveFolder(onPick) {
+    const v = this;
+    class FolderPick extends FuzzySuggestModal {
+      getItems() { return ['＋ 新建文件夹…', ...v.archiveFolders()]; }
+      getItemText(x) { return x; }
+      onChooseItem(x) { if (x.startsWith('＋')) v.newArchiveFolder(onPick); else onPick(x); }
+    }
+    const m = new FolderPick(this.app);
+    m.setPlaceholder('移动到哪个文件夹？');
+    m.open();
   }
 
   /* ================= 原表样式视图 ================= */
@@ -3663,7 +4086,8 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     if (!(f instanceof TFile)) return false;
     const folder = normalizePath(this.settings.folder) + '/';
     if (f.path.startsWith(this.archiveDir() + '/') || f.path.startsWith(folder + '导出/') || f.path.startsWith(folder + AUTO_DIR + '/')) return false;
-    if (f.path.startsWith(folder) && GUIDE_FILES.includes(f.path.slice(folder.length))) return false;
+    if (f.path.startsWith(folder) && (GUIDE_FILES.includes(f.path.slice(folder.length)) || DOC_FILES.includes(f.path.slice(folder.length)))) return false;
+    if (f.path.startsWith(folder + OUT_DIR + '/')) return false;
     if (f.extension === 'csv') return true;
     if (f.extension === 'md') {
       const meta = this.settings.meta || {};
@@ -3752,7 +4176,8 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
         await this.snapPut(f.path, text, f.stat);
         if (why === 'create' || why === 'scan-new') {
           const t = this.parseTableText(f, text);
-          this.logOp({ type: 'ext-new', path: f.path, text: `外部新建了表格（${t.rows.length} 行，列：${t.headers.slice(0, 8).join('、')}${t.headers.length > 8 ? '…' : ''}）`, review: 'ok' });
+          this.logOp({ type: 'ext-new', path: f.path, text: `新建了表格（${t.rows.length} 行，列：${t.headers.slice(0, 8).join('、')}${t.headers.length > 8 ? '…' : ''}）`, review: 'ok' });
+          this.scheduleOutput(f);
         }
         return;
       }
@@ -3799,6 +4224,8 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
       if (link) { this.link = link; this.attachProvenance(this.table, link.map); }
       this.tableVersion = (this.tableVersion || 0) + 1;
     }
+    this.scheduleOutput(f);
+    this.scheduleDocs();
     if (nothing) { if (this.file && this.file.path === f.path && this.tab === 'workspace') this.renderTable(); return; }
 
     const hdr = newT.headers.map(String);
@@ -3819,13 +4246,13 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     ];
     if (!parts.length && items.length) parts.push(items[0]);
     this.logOp({
-      type: 'ext', path: f.path, text: parts.join('，'), review: 'pending', hist, after: hashStr(newText),
+      type: 'ext', path: f.path, text: parts.join('，'), review: 'ok', hist, after: hashStr(newText),
       cells: d.cells.slice(0, 300).map((x) => ({ r: x.r + 1, h: hdr[x.c], o: x.o, n: x.n })), cellsN: d.cells.length,
       hdr, added: d.added.slice(0, 30).map((r) => newT.rows[r].map(cellStr)), addedN: d.added.length,
       oldHdr: oldT.headers.map(String), rows: d.removed.slice(0, 30).map((r) => oldT.rows[r].map(cellStr)), rowsN: d.removed.length,
       items,
     });
-    new Notice(`「${this.tableLabel(f.path)}」被外部修改：${parts.join('，')}。在工作台里可以查看、确认或撤销。`, 8000);
+    new Notice(`「${this.tableLabel(f.path)}」${parts.join('，')}，原表 Excel 稍后自动更新。`, 6000);
     if (this.file && this.file.path === f.path && this.tab === 'workspace') { this.renderTable(); this.renderReview(); }
     else this.scheduleRender();
   }
@@ -3860,7 +4287,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
         link = await this.readLink(meta.link.id, meta.link.sheet);
         if (link) { link.map.rows = h.rows; if (h.cols) link.map.cols = h.cols; await this.writeLinkMap(link); }
       }
-      (this.plugin.opLog || []).forEach((x) => { if (x.type === 'ext' && x.path === f.path && x.review === 'pending' && x.t >= e.t) x.review = 'undone'; });
+      (this.plugin.opLog || []).forEach((x) => { if (x.type === 'ext' && x.path === f.path && x.review !== 'undone' && x.t >= e.t) x.review = 'undone'; });
       e.review = 'undone';
       if (this.hlMap) this.hlMap.delete(f.path);
       this.logOp({ type: 'undo', path: f.path, text: `撤销了外部修改（${e.text}）` });
@@ -3869,7 +4296,8 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
         if (link) { this.link = link; this.attachProvenance(this.table, link.map); }
         this.tableVersion = (this.tableVersion || 0) + 1;
       }
-      new Notice('已撤销这次外部修改，表格恢复到修改前。');
+      new Notice('已撤销这次修改，表格恢复到修改前，原表 Excel 也会跟着更新。');
+      this.scheduleOutput(f);
       await this.render();
     };
     if (hashStr(cur) !== e.after) {
@@ -4025,6 +4453,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     }
     if (list.length > 3000) list.splice(0, list.length - 3000);
     this.saveOpLog();
+    this.scheduleDocs();
     if (this.tab === 'home' && !this.importRun) this.scheduleRender();
   }
 
@@ -4043,7 +4472,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
       return;
     }
     const all = this.plugin.opLog;
-    const KINDS = [['全部', null], ['外部修改', ['ext', 'ext-new', 'ext-del']], ['旧版记录', ['ai']], ['手动修改', ['edit', 'row', 'col', 'undo']], ['导入导出', ['import', 'export', 'create']], ['附件', ['archive']], ['删除', ['delete']]];
+    const KINDS = [['全部', null], ['表格修改', ['ext', 'ext-new', 'ext-del', 'edit', 'row', 'col']], ['处理说明', ['note']], ['原表更新失败', ['output']], ['旧版记录', ['ai']], ['撤销', ['undo']], ['导入导出', ['import', 'export', 'create']], ['附件', ['archive']], ['删除', ['delete']]];
     const kindKey = this.opKind || '全部';
     const types = (KINDS.find((k) => k[0] === kindKey) || KINDS[0])[1];
     const chips = hr.createDiv('ata-catbar');
@@ -4071,7 +4500,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
       box.createDiv({ cls: 'ata-empty-sm', text: all.length ? '没有符合条件的记录。' : '还没有操作记录。之后导入、外部修改、手动修改、导出、删除都会记在这里，可以随时回来查改了什么。' });
       return;
     }
-    const TYPE = { ext: ['外部修改', 'file-diff'], 'ext-new': ['外部新建', 'file-plus'], 'ext-del': ['外部删除', 'file-x'], ai: ['旧版', 'history'], edit: ['手动', 'pencil'], row: ['行', 'rows-3'], col: ['列', 'columns-3'], undo: ['撤销', 'undo-2'], import: ['导入', 'folder-down'], export: ['导出', 'download'], create: ['新建', 'file-plus'], delete: ['删除', 'trash-2'], archive: ['附件', 'archive'] };
+    const TYPE = { note: ['说明', 'message-square-text'], output: ['原表', 'file-spreadsheet'], ext: ['修改', 'file-diff'], 'ext-new': ['新建', 'file-plus'], 'ext-del': ['删除', 'file-x'], ai: ['旧版', 'history'], edit: ['手动', 'pencil'], row: ['行', 'rows-3'], col: ['列', 'columns-3'], undo: ['撤销', 'undo-2'], import: ['导入', 'folder-down'], export: ['导出', 'download'], create: ['新建', 'file-plus'], delete: ['删除', 'trash-2'], archive: ['附件', 'archive'] };
     const show = this.opShow || 60;
     const items = list.slice(-show).reverse();
     const dayOf = (ts) => { const d = new Date(ts); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`; };
@@ -4101,17 +4530,18 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
         else chip.title = '这张表已经不在了';
       }
       line.createSpan({ cls: 'ata-tl-text', text: e.text || '' });
-      if (e.type === 'ext' && e.review) {
-        line.createSpan({ cls: 'ata-tl-review r-' + e.review, text: { pending: '待确认', ok: '已确认', undone: '已撤销' }[e.review] || '' });
-        if (e.review === 'pending') {
+      if (e.review === 'undone') line.createSpan({ cls: 'ata-tl-review r-undone', text: '已撤销' });
+      if (e.output) {
+        const oc = line.createSpan({ cls: 'ata-tl-review r-ok', text: '原表已更新', attr: { title: e.outFile ? this.absPath(e.outFile) : '' } });
+        if (e.outFile) { oc.addClass('is-link'); oc.addEventListener('click', () => this.app.openWithDefaultApp && this.app.openWithDefaultApp(e.outFile)); }
+      }
+      if (e.error) line.createSpan({ cls: 'ata-tl-review r-err', text: '失败' });
+      if (e.type === 'ext' && e.hist && e.review !== 'undone') {
+        const latest = (this.plugin.opLog || []).filter((x) => x.type === 'ext' && x.path === e.path && x.review !== 'undone').slice(-1)[0] === e;
+        if (latest) {
           const rb = main.createDiv('ata-tl-rbtns');
-          const latest = this.pendingFor(e.path).slice(-1)[0] === e;
-          const ok = rb.createEl('button', { cls: 'ata-tl-rbtn is-ok', text: '确认' });
-          ok.addEventListener('click', () => this.confirmExternal(e.path));
-          if (latest && e.hist) {
-            const un = rb.createEl('button', { cls: 'ata-tl-rbtn', text: '撤销这次修改' });
-            un.addEventListener('click', () => this.undoExternal(e));
-          }
+          const un = rb.createEl('button', { cls: 'ata-tl-rbtn', text: '撤销这次修改' });
+          un.addEventListener('click', () => this.undoExternal(e));
         }
       }
       if (e.ask) main.createDiv({ cls: 'ata-tl-ask', text: '“' + e.ask + '”' + (e.atts && e.atts.length ? `  📎 ${e.atts.join('、')}` : '') });
@@ -4560,9 +4990,6 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     return p;
   }
 
-  async openTable(file) {
-    await this.loadFile(file, { switchTab: true });
-  }
 
   async loadFile(file, opts) {
     opts = opts || {};
@@ -4636,10 +5063,12 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     } finally {
       setTimeout(() => (this.selfWrite = false), 300);
     }
+    this.scheduleOutput(this.file);
   }
 
   async handleDrop(list, zone) {
     if (!list.length) return;
+    if (zone && zone.startsWith('folder:')) { const keep = this.archFolder; this.archFolder = zone.slice(7); await this.archiveSave(list.map((x) => x.file).filter((f) => f.size > 0), '拖入'); if (keep !== undefined) this.archFolder = keep; return; }
     if (zone === 'archive' || this.tab === 'archive') { await this.archiveSave(list.map((x) => x.file).filter((f) => f.size > 0), '拖入'); return; }
     const isFolder = list.some((x) => x.rel.includes('/'));
     if (zone === 'import' || isFolder) { await this.importBatch(list); return; }
@@ -4743,7 +5172,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     files = (files || []).filter(Boolean);
     if (!files.length) return [];
     const d = new Date(), z = (n) => String(n).padStart(2, '0');
-    const folder = `${this.archiveDir()}/${d.getFullYear()}-${z(d.getMonth() + 1)}`;
+    const folder = this.tab === 'archive' && this.archFolder ? `${this.archiveDir()}/${this.archFolder}` : `${this.archiveDir()}/${d.getFullYear()}-${z(d.getMonth() + 1)}`;
     const existing = this.archiveFiles();
     const meta = this.settings.archiveMeta || (this.settings.archiveMeta = {});
     const saved = [];
@@ -4822,18 +5251,54 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     const title = left.createDiv('ata-title');
     this.ico(title, 'archive');
     title.createSpan({ text: '附件区' });
-    left.createDiv({ cls: 'ata-sub', text: `${all.length} 个文件 · 共 ${fmtSize(all.reduce((a, f) => a + f.stat.size, 0))} · 收到的单据、截图、PDF、Excel 都可以存在这里，按月份归档` });
+    left.createDiv({ cls: 'ata-sub', text: `${all.length} 个文件 · 共 ${fmtSize(all.reduce((a, f) => a + f.stat.size, 0))} · 收到的单据、截图、PDF、Excel 都可以存在这里，可以新建文件夹分类` });
     const right = head.createDiv('ata-header-right');
-    this.btn(right, this.archSelect ? '完成' : '批量管理', this.archSelect ? 'check' : 'list-checks', () => { this.archSelect = !this.archSelect; this.archSel.clear(); this.render(); });
-    if (this.app.showInFolder) this.btn(right, '打开文件夹', 'folder-open', async () => { await this.ensureFolder(this.archiveDir()); this.app.showInFolder(this.archiveDir()); });
+    this.btn(right, this.archSelect ? '完成' : '多选', this.archSelect ? 'check' : 'list-checks', () => { this.archSelect = !this.archSelect; this.archSel.clear(); this.render(); });
+    this.btn(right, '打开文件夹', 'folder-open', async () => { const d = this.archFolder ? `${this.archiveDir()}/${this.archFolder}` : this.archiveDir(); await this.ensureFolder(d); this.showInSystem(d); });
     this.btn(right, '上传文件', 'upload', () => this.archiveInput.click(), 'mod-cta');
 
     const dz = wrap.createDiv('ata-dropzone ata-archive-drop');
     this.ico(dz, 'archive', 'ata-dropzone-icon');
     const txt = dz.createDiv('ata-dropzone-text');
     txt.createEl('b', { text: '把文件拖到这里存档（任何类型都可以）' });
-    txt.createSpan({ text: `也可以点这里选择文件，或在本页按 Ctrl+V 粘贴复制的文件 / 截图 / 文件路径。保存在「${this.archiveDir()}」，按月份分文件夹。` });
+    txt.createSpan({ text: `也可以点这里选择文件，或在本页按 Ctrl+V 粘贴复制的文件 / 截图 / 文件路径。${this.archFolder ? `存进当前文件夹「${this.archFolder}」。` : '没选文件夹时按月份归档。'}` });
     dz.addEventListener('click', () => this.archiveInput.click());
+
+    /* 文件夹 */
+    const folders = this.archiveFolders();
+    if (this.archFolder && !folders.includes(this.archFolder)) this.archFolder = '';
+    const inFolder = (f, fd) => { const x = this.folderOf(f); return x === fd || x.startsWith(fd + '/'); };
+    const fdbar = wrap.createDiv('ata-folderbar');
+    const fchip = (label, fd, n) => {
+      const b = fdbar.createEl('button', { cls: 'ata-folderchip' + ((this.archFolder || '') === fd ? ' is-active' : '') });
+      this.ico(b, fd ? 'folder' : 'folders');
+      b.createSpan({ text: label });
+      b.createSpan({ cls: 'ata-tab-count', text: String(n) });
+      b.addEventListener('click', () => { this.archFolder = fd; this.render(); });
+      if (fd) {
+        b.setAttribute('data-drop-folder', fd);
+        b.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          const cnt = all.filter((f) => inFolder(f, fd)).length;
+          if (cnt) { new Notice(`「${fd}」里还有 ${cnt} 个文件，先移走或删掉才能删除文件夹。`); return; }
+          new ConfirmModal(this.app, `删除空文件夹「${fd}」？`, '', [{ text: '删除', warning: true, onClick: async () => {
+            const fo = this.app.vault.getAbstractFileByPath(`${this.archiveDir()}/${fd}`);
+            try { if (fo) await this.app.vault.delete(fo, true); } catch (err) { /* 已经没有了 */ }
+            this.settings.archiveFolders = (this.settings.archiveFolders || []).filter((x) => x !== fd);
+            await this.plugin.saveSettings();
+            this.archFolder = '';
+            this.render();
+          } }]).open();
+        });
+      }
+    };
+    fchip('全部', '', all.length);
+    folders.forEach((fd) => fchip(fd, fd, all.filter((f) => inFolder(f, fd)).length));
+    const nb = fdbar.createEl('button', { cls: 'ata-folderchip is-new' });
+    this.ico(nb, 'folder-plus');
+    nb.createSpan({ text: '新建文件夹' });
+    nb.addEventListener('click', () => this.newArchiveFolder());
+    if (folders.length) fdbar.createSpan({ cls: 'ata-muted ata-folderhint', text: '右键空文件夹可以删除' });
 
     if (!all.length) return;
     const counts = {};
@@ -4851,7 +5316,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     });
     const q = fbar.createEl('input', { cls: 'ata-archive-search', attr: { type: 'text', placeholder: '搜索文件名、备注…' } });
     q.value = this.archQuery || '';
-    let list = all.filter((f) => (!this.archKind || archiveKind(f) === this.archKind));
+    let list = all.filter((f) => (!this.archKind || archiveKind(f) === this.archKind) && (!this.archFolder || inFolder(f, this.archFolder)));
     const applyQ = () => {
       const s = (this.archQuery || '').toLowerCase();
       grid.querySelectorAll('.ata-acard').forEach((c) => { c.style.display = !s || c.dataset.q.includes(s) ? '' : 'none'; });
@@ -4864,6 +5329,9 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
       this.archCountEl = cnt;
       const sel = () => all.filter((f) => this.archSel.has(f.path));
       this.btn(sb, '全选', 'check-square', () => { list.forEach((f) => this.archSel.add(f.path)); this.render(); }, 'ata-btn-sm');
+      this.btn(sb, '复制文件', 'files', () => { const s = sel(); if (s.length) this.copyFiles(s.map((f) => f.path)); }, 'ata-btn-sm mod-cta');
+      this.btn(sb, '复制路径', 'copy', () => { const s = sel(); if (s.length) this.copyPaths(s.map((f) => f.path), '路径'); }, 'ata-btn-sm');
+      this.btn(sb, '移动到…', 'folder-input', () => { const s = sel(); if (s.length) this.pickArchiveFolder((fd) => this.moveArchive(s, fd)); }, 'ata-btn-sm');
       this.btn(sb, '删除所选', 'trash-2', () => {
         const s = sel();
         if (!s.length) return;
@@ -4910,6 +5378,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
       cp.addEventListener('click', (e) => { e.stopPropagation(); this.copyText(this.absPath(f.path), '文件路径'); });
       const sp = c.createDiv('ata-atools');
       if (archiveKind(f) === 'image') this.iconBtn(sp, 'copy', '复制图片', () => copyImageNotice(this.app, f));
+      this.iconBtn(sp, 'folder-input', '移动到文件夹', () => this.pickArchiveFolder((fd) => this.moveArchive([f], fd)));
       this.iconBtn(sp, 'eye', '预览', () => new LightboxModal(this.app, this, f).open());
       if (this.app.openWithDefaultApp) this.iconBtn(sp, 'external-link', '用默认程序打开', () => this.app.openWithDefaultApp(f.path));
       this.iconBtn(sp, 'trash-2', '删除', () => new ConfirmModal(this.app, `删除「${f.name}」？`, '会移到回收站，需要时可以恢复。', [{ text: '删除', warning: true, onClick: () => this.archiveDelete([f]) }]).open()).addClass('is-danger');
@@ -4982,7 +5451,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     const tables = list.filter((x) => TABLE_EXT.test(x.file.name) && !x.file.name.startsWith('~$'));
     const skipped = list.length - tables.length;
     if (!tables.length) { new Notice('没有找到可导入的表格文件（支持 csv / tsv / xlsx / md）。'); return; }
-    const root = normalizePath(this.settings.folder);
+    const root = this.dataDir();
     const run = this.importRun = { cancel: false, done: 0, total: tables.length, current: '', bytes: 0 };
     const totalBytes = tables.reduce((a, x) => a + (x.file.size || 0), 0);
     this.showImportBar(totalBytes);
@@ -5076,6 +5545,17 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     if (skipped) msg.push(`${skipped} 个非表格文件已跳过`);
     if (failed.length) msg.push(`${failed.length} 个失败：${failed.slice(0, 3).join('；')}${failed.length > 3 ? '…' : ''}`);
     new Notice(msg.join('，'), failed.length ? 12000 : 6000);
+    /* 每个导入的表格马上生成一份原表 Excel */
+    const doneGroups = new Set();
+    (run.paths || []).forEach((p) => {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile)) return;
+      const dest = this.outPathOf(f);
+      if (doneGroups.has(dest)) return;
+      doneGroups.add(dest);
+      this.scheduleOutput(f, 500);
+    });
+    this.scheduleDocs();
     if (ok || failed.length) this.logOp({ type: 'import', text: msg.join('，') + (opts.from ? `（${opts.from}）` : ''), items: (run.names || []).slice(0, 300) });
     if (opts.quiet) { await this.render(); return { ok, failed, paths: run.paths || [], names: run.names || [] }; }
     if (ok === 1 && lastFile) await this.openTable(lastFile);
@@ -5115,7 +5595,8 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
   async createTable(name, cols, fmt, quiet) {
     try {
       const t = { headers: cols, rows: [] };
-      const path = await this.uniquePath(this.settings.folder, baseName(name), fmt);
+      await this.ensureFolder(this.dataDir());
+      const path = await this.uniquePath(this.dataDir(), baseName(name), fmt);
       const content = fmt === 'md' ? (cols.length ? toMarkdown(t) + '\n' : '') : cols.length ? toCSV(t) : '';
       await this.snapPut(path, content);
       const file = await this.app.vault.create(path, content);
@@ -5152,7 +5633,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
   /** 把改动写回原 Excel：颜色、合并单元格、图片、公式、列宽、没改的工作表都保留 */
   async exportLinked(file, files, opts) {
     opts = opts || {};
-    const notice = new Notice('正在按原 Excel 格式导出…', 0);
+    const notice = opts.silent ? { hide() {} } : new Notice('正在按原 Excel 格式导出…', 0);
     try {
       await this.flushSave();
       const meta = this.settings.meta || {};
@@ -5172,13 +5653,13 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
       try { bookName = baseName(JSON.parse(await this.app.vault.adapter.read(`${this.ataDir()}/maps/${id}/book.json`)).name); } catch (e) { /* 用工作簿名 */ }
       const d = new Date(), z = (n) => String(n).padStart(2, '0');
       const stamp = `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`;
-      const path = await this.uniquePath(this.settings.folder + '/导出', `${bookName}-${stamp}`, 'xlsx');
-      await this.app.vault.createBinary(path, res.buffer);
+      const path = opts.dest || await this.uniquePath(this.settings.folder + '/导出', `${bookName}-${stamp}`, 'xlsx');
+      await this.writeBinaryTo(path, res.buffer);
       notice.hide();
       const msg = `已按原格式导出到 ${path}：${res.sheetsChanged ? `${res.sheetsChanged} 个工作表有改动，共 ${res.changed} 个单元格` : '没有改动，和原文件一致'}` +
         (res.formulasDropped ? `；有 ${res.formulasDropped} 个共享公式因所在单元格被改动而转成了数值` : '');
-      new Notice(msg, 10000);
-      this.logOp({ type: 'export', path: file.path, name: bookName, text: `按原格式导出 Excel${res.sheetsChanged ? `（${res.sheetsChanged} 个工作表有改动，${res.changed} 个单元格）` : '（没有改动）'}${opts.from ? `（${opts.from}）` : ''}`, file: path });
+      if (!opts.silent) new Notice(msg, 10000);
+      if (!opts.nolog) this.logOp({ type: 'export', path: file.path, name: bookName, text: `按原格式导出 Excel${res.sheetsChanged ? `（${res.sheetsChanged} 个工作表有改动，${res.changed} 个单元格）` : '（没有改动）'}${opts.from ? `（${opts.from}）` : ''}`, file: path });
       if (!opts.quiet && this.settings.openAfterExport && this.app.openWithDefaultApp) {
         try { await this.app.openWithDefaultApp(path); } catch (e) { /* 打不开就只保存 */ }
       }
@@ -5202,10 +5683,10 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
       }
       const d = new Date(), z = (n) => String(n).padStart(2, '0');
       const stamp = `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`;
-      const path = await this.uniquePath(this.settings.folder + '/导出', `${meta[file.path].workbook}-${stamp}`, 'xlsx');
-      await this.app.vault.createBinary(path, toXLSXBook(sheets));
-      new Notice(`已导出整个工作簿（${sheets.length} 个工作表）到 ${path}`, 8000);
-      this.logOp({ type: 'export', path: file.path, name: meta[file.path].workbook, text: `导出整个工作簿（${sheets.length} 个工作表）${opts.from ? `（${opts.from}）` : ''}`, file: path });
+      const path = opts.dest || await this.uniquePath(this.settings.folder + '/导出', `${meta[file.path].workbook}-${stamp}`, 'xlsx');
+      await this.writeBinaryTo(path, toXLSXBook(sheets));
+      if (!opts.silent) new Notice(`已导出整个工作簿（${sheets.length} 个工作表）到 ${path}`, 8000);
+      if (!opts.nolog) this.logOp({ type: 'export', path: file.path, name: meta[file.path].workbook, text: `导出整个工作簿（${sheets.length} 个工作表）${opts.from ? `（${opts.from}）` : ''}`, file: path });
       if (!opts.quiet && this.settings.openAfterExport && this.app.openWithDefaultApp) {
         try { await this.app.openWithDefaultApp(path); } catch (e) { /* 打不开就只保存 */ }
       }
@@ -5221,12 +5702,12 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     try {
       const d = new Date(), z = (n) => String(n).padStart(2, '0');
       const stamp = `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`;
-      const path = await this.uniquePath(this.settings.folder + '/导出', file.basename + '-' + stamp, fmt);
-      if (fmt === 'xlsx') await this.app.vault.createBinary(path, toXLSX(table));
+      const path = opts.dest || await this.uniquePath(this.settings.folder + '/导出', file.basename + '-' + stamp, fmt);
+      if (fmt === 'xlsx') await this.writeBinaryTo(path, toXLSX(table));
       else if (fmt === 'csv') await this.app.vault.create(path, '﻿' + toCSV(table));
       else await this.app.vault.create(path, toMarkdown(table) + '\n');
-      new Notice('已导出到 ' + path, 8000);
-      this.logOp({ type: 'export', path: file.path, text: `导出为 ${fmt.toUpperCase()}${opts.from ? `（${opts.from}）` : ''}`, file: path });
+      if (!opts.silent) new Notice('已导出到 ' + path, 8000);
+      if (!opts.nolog) this.logOp({ type: 'export', path: file.path, text: `导出为 ${fmt.toUpperCase()}${opts.from ? `（${opts.from}）` : ''}`, file: path });
       if (!opts.quiet && fmt === 'xlsx' && this.settings.openAfterExport && this.app.openWithDefaultApp) {
         try { await this.app.openWithDefaultApp(path); } catch (e) { /* 打不开就只保存 */ }
       }
@@ -5235,6 +5716,13 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
       if (opts.quiet) throw e;
       new Notice('导出失败：' + e.message, 8000);
     }
+  }
+
+  /** 写二进制文件：已存在就覆盖 */
+  async writeBinaryTo(path, buf) {
+    const f = this.app.vault.getAbstractFileByPath(path);
+    if (f instanceof TFile) await this.app.vault.modifyBinary(f, buf);
+    else await this.app.vault.createBinary(path, buf);
   }
 
   /* ---------- 撤销 ---------- */
@@ -5307,11 +5795,12 @@ class AITableAssistantPlugin extends Plugin {
     this.registerView(VIEW_TYPE, (leaf) => new TableWorkbenchView(leaf, this));
     this.addRibbonIcon('table', '表格工作台', () => this.activateView());
     this.addCommand({ id: 'open-panel', name: '打开表格工作台', callback: () => this.activateView() });
+    this.addCommand({ id: 'refresh-outputs', name: '立即更新全部原表 Excel', callback: () => this.activateView(true, true).then((v) => { if (!v) return; const seen = new Set(); v.tableFiles().forEach((f, i) => { const d = v.outPathOf(f); if (!seen.has(d)) { seen.add(d); v.scheduleOutput(f, 300 + i * 50); } }); }) });
     this.addCommand({ id: 'tour', name: '查看使用引导', callback: () => this.activateView().then((v) => v && v.startTour()) });
-    this.addCommand({ id: 'quick-switch', name: '快速切换表格', callback: () => this.activateView().then((v) => v && v.quickSwitch()) });
+    this.addCommand({ id: 'quick-switch', name: '在文件管理中查找表格', callback: () => this.activateView().then((v) => v && v.quickSwitch()) });
     this.addCommand({
       id: 'use-active-file',
-      name: '在工作台中打开当前表格',
+      name: '在文件管理中定位当前表格',
       checkCallback: (checking) => {
         const f = this.app.workspace.getActiveFile();
         if (!f || (f.extension !== 'md' && f.extension !== 'csv')) return false;

@@ -654,3 +654,47 @@ input.ata-route-search { width: 100%; margin-bottom: 8px; }
 .ata-xlpane .xc.xadd { box-shadow: inset 0 0 0 999px rgba(34, 197, 94, .28); }
 .ata-xlpane .xc.xmod { box-shadow: inset 0 0 0 999px rgba(234, 179, 8, .38), inset 0 0 0 1px #ca8a04; }
 .ata-xlpane .xc.xsel { outline: 2px solid #107c41; outline-offset: -2px; z-index: 2; }
+
+/* ── 文件管理 ── */
+.ata-fmbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0 8px; min-height: 30px; }
+.ata-fmbar-acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.ata-fm-check { width: 15px; height: 15px; cursor: pointer; }
+.ata-fmlist { border: 1px solid var(--ata-border); border-radius: 10px; overflow: hidden; background: var(--background-primary); }
+.ata-fmrow { display: grid; grid-template-columns: 34px minmax(220px, 1fr) 120px 80px 110px 170px 150px; align-items: center; gap: 6px; padding: 7px 10px; border-top: 1px solid var(--ata-border); font-size: 13px; cursor: pointer; }
+.ata-fmrow:first-child { border-top: none; }
+.ata-fmrow.is-head { background: var(--ata-surface); font-size: 12px; font-weight: 600; color: var(--text-muted); cursor: default; }
+.ata-fmrow:not(.is-head):hover { background: var(--background-modifier-hover); }
+.ata-fmrow.is-selected { background: var(--ata-accent-soft); }
+.ata-fmrow.is-flash { animation: ata-flash 1.4s ease; }
+@keyframes ata-flash { 0%, 40% { background: rgba(234, 179, 8, .35); } 100% { background: transparent; } }
+.ata-fm-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.ata-fm-twist { display: inline-flex; color: var(--text-faint); width: 14px; }
+.ata-fm-twist svg { width: 14px; height: 14px; }
+.ata-fm-nt { min-width: 0; }
+.ata-fm-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ata-fm-path { font-size: 11px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ata-fm-type, .ata-fm-time { font-size: 12px; color: var(--text-muted); }
+.ata-fm-num { font-variant-numeric: tabular-nums; text-align: right; padding-right: 10px; }
+.ata-fm-st { font-size: 12px; padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
+.ata-fm-st.is-ok { color: #16a34a; background: rgba(22, 163, 74, .1); }
+.ata-fm-st.is-pending { color: var(--text-muted); background: var(--background-modifier-hover); }
+.ata-fm-st.is-warn { color: #a16207; background: rgba(234, 179, 8, .16); }
+.ata-fm-st.is-err { color: #dc2626; background: rgba(239, 68, 68, .12); }
+.ata-fm-acts { display: flex; justify-content: flex-end; gap: 0; }
+.ata-fm-acts .ata-iconbtn { width: 28px; height: 28px; }
+.ata-fmsub { background: var(--ata-surface); border-top: 1px solid var(--ata-border); padding: 4px 10px 6px 60px; }
+.ata-fmsubrow { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 12px; }
+.ata-fmsubrow .ata-fm-sheet { font-weight: 600; min-width: 120px; }
+.ata-fmsubrow .ata-muted { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 900px) { .ata-fmrow { grid-template-columns: 30px minmax(160px, 1fr) 90px 120px; } .ata-fmrow > :nth-child(3), .ata-fmrow > :nth-child(4), .ata-fmrow > :nth-child(5) { display: none; } }
+
+/* ── 附件区文件夹 ── */
+.ata-folderbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 12px; }
+.ata-root button.ata-folderchip { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--ata-border); background: var(--ata-surface); color: var(--text-normal); box-shadow: none; font-size: 12px; cursor: pointer; }
+.ata-root button.ata-folderchip .ata-icon svg { width: 14px; height: 14px; }
+.ata-root button.ata-folderchip.is-active { background: var(--ata-accent); border-color: var(--ata-accent); color: var(--ata-accent-ink); font-weight: 600; }
+.ata-root button.ata-folderchip.is-new { border-style: dashed; color: var(--text-muted); }
+.ata-root button.ata-folderchip.is-drop-over { box-shadow: 0 0 0 3px var(--ata-accent-soft); border-color: var(--ata-accent); }
+.ata-folderhint { font-size: 11px; }
+.ata-tl-review.r-err { background: rgba(239, 68, 68, .12); color: #dc2626; }
+.ata-tl-review.is-link { cursor: pointer; text-decoration: underline dotted; }

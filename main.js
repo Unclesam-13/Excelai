@@ -1895,6 +1895,8 @@ class TableWorkbenchView extends ItemView {
     }));
     this.registerEvent(this.app.vault.on('rename', (f, old) => { this.onExtRename(f, old); this.scheduleRender(); }));
 
+    try { await this.rebuildFromMaps(); } catch (e) { console.warn('[AI表格助手] 恢复 Excel 对应关系失败', e); }
+    if (this.plugin.restoredFromBackup) new Notice(`插件设置丢失了，已从表格文件夹里的备份恢复 ${this.plugin.restoredFromBackup} 张表的分组和格式信息。`, 10000);
     const last = this.settings.lastTable && this.app.vault.getAbstractFileByPath(this.settings.lastTable);
     if (last instanceof TFile) await this.loadFile(last, { silent: true, switchTab: false });
     await this.render();
@@ -2800,6 +2802,39 @@ class TableWorkbenchView extends ItemView {
 
   /* ---------- 和原 Excel 的对应关系（保存在表格库的隐藏文件夹 .ata 里） ---------- */
   ataDir() { return normalizePath(this.settings.folder) + '/.ata'; }
+
+  /** 插件设置里缺了 Excel 工作簿的对应关系（比如换了电脑），按 .ata 里保存的原 Excel 信息补回来 */
+  async rebuildFromMaps() {
+    const a = this.app.vault.adapter, dir = this.ataDir() + '/maps';
+    if (!(await a.exists(dir))) return;
+    const ids = (await a.list(dir)).folders || [];
+    const books = [];
+    for (const d of ids) {
+      try { const b = JSON.parse(await a.read(d + '/book.json')); books.push({ id: d.split('/').pop(), ...b }); } catch (e) { /* 不完整，跳过 */ }
+    }
+    books.sort((x, y) => (x.imported || 0) - (y.imported || 0));
+    const meta = this.settings.meta || (this.settings.meta = {});
+    const root = normalizePath(this.settings.folder);
+    const csvs = this.app.vault.getFiles().filter((f) => f.extension === 'csv' && f.path.startsWith(root + '/'));
+    let fixed = 0;
+    for (const b of books) {
+      if (!(await a.exists(`${this.ataDir()}/sources/${b.id}.xlsx`))) continue;
+      const book = baseName(b.name || '');
+      const sheets = b.sheets || [];
+      const multi = sheets.length > 1;
+      for (const sh of sheets) {
+        const want = multi ? `/${book}/${baseName(sh.name)}.csv` : `/${book}.csv`;
+        const f = csvs.find((x) => ('/' + x.path).endsWith(want));
+        if (!f) continue;
+        const m = meta[f.path] || (meta[f.path] = {});
+        if (m.link && m.link.id === b.id) continue;
+        m.link = { id: b.id, sheet: sh.index };
+        if (multi) Object.assign(m, { workbook: book, sheet: sh.name, sheetIndex: sh.index });
+        fixed++;
+      }
+    }
+    if (fixed) { await this.plugin.saveSettings(); new Notice(`已恢复 ${fixed} 张表和原 Excel 的对应关系。`); }
+  }
 
   /* ================= 外部修改：快照、对比、确认、撤销 ================= */
   isTableFile(f) {
@@ -4614,6 +4649,7 @@ class AITableAssistantPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     if (!this.settings.meta) this.settings.meta = {};
+    await this.restoreFromBackup();
     if (!Array.isArray(this.settings.pinned)) this.settings.pinned = [];
     if (!Array.isArray(this.settings.recent)) this.settings.recent = [];
     if (!this.settings.archiveMeta || typeof this.settings.archiveMeta !== 'object') this.settings.archiveMeta = {};
@@ -4649,7 +4685,43 @@ class AITableAssistantPlugin extends Plugin {
     this.addSettingTab(new AITableSettingTab(this.app, this));
   }
 
-  async saveSettings() { await this.saveData(this.settings); }
+  async saveSettings() {
+    await this.saveData(this.settings);
+    clearTimeout(this.backupTimer);
+    this.backupTimer = setTimeout(() => this.writeBackup(), 1500);
+  }
+
+  backupPath() { return normalizePath(this.settings.folder + '/.ata/settings-backup.json'); }
+
+  /** 插件设置（Excel 分组、原格式对应、分类、常用）另存一份在表格文件夹里：
+      换电脑、同步出错或插件被重装时，data.json 丢了也能恢复 */
+  async writeBackup() {
+    const s = this.settings, a = this.app.vault.adapter;
+    const n = Object.keys(s.meta || {}).length;
+    try {
+      if (!n) {
+        try { const old = JSON.parse(await a.read(this.backupPath())); if (Object.keys(old.meta || {}).length) return; } catch (e) { /* 没有旧备份 */ }
+      }
+      const dir = this.backupPath().replace(/\/[^/]+$/, '');
+      if (!(await a.exists(dir))) await a.mkdir(dir);
+      await a.write(this.backupPath(), JSON.stringify({ savedAt: Date.now(), meta: s.meta, pinned: s.pinned, recent: s.recent, archiveMeta: s.archiveMeta, onboarded: s.onboarded, lastTable: s.lastTable }));
+    } catch (e) { console.warn('[AI表格助手] 备份设置失败', e); }
+  }
+
+  async restoreFromBackup() {
+    const s = this.settings;
+    if (Object.keys(s.meta || {}).length) return;
+    let b;
+    try { b = JSON.parse(await this.app.vault.adapter.read(this.backupPath())); } catch (e) { return; }
+    if (!b || !Object.keys(b.meta || {}).length) return;
+    s.meta = b.meta;
+    if (!(s.pinned || []).length && Array.isArray(b.pinned)) s.pinned = b.pinned;
+    if ((s.recent || []).length < 2 && Array.isArray(b.recent)) s.recent = [...new Set([...(s.recent || []), ...b.recent])].slice(0, 20);
+    if (!Object.keys(s.archiveMeta || {}).length && b.archiveMeta) s.archiveMeta = b.archiveMeta;
+    if (b.onboarded) s.onboarded = true;
+    await this.saveData(s);
+    this.restoredFromBackup = Object.keys(b.meta).length;
+  }
 
   async activateView() {
     const ws = this.app.workspace;

@@ -2,7 +2,7 @@
 /* 表格工作台 —— Obsidian 插件（无需构建，直接使用本文件） */
 const {
   Plugin, ItemView, Notice, Modal, FuzzySuggestModal, PluginSettingTab,
-  Setting, setIcon, normalizePath, TFile,
+  Setting, setIcon, normalizePath, TFile, requestUrl,
 } = require('obsidian');
 
 const VIEW_TYPE = 'ai-table-assistant-view';
@@ -18,7 +18,7 @@ const AUTO_DIR = '自动处理';
 const DATA_DIR = '数据';
 const OUT_DIR = '表格';
 /* 插件在表格文件夹根目录生成的说明文件（不是表格） */
-const DOC_FILES = ['操作守则.md', '数据目录.md', '操作日志.md'];
+const DOC_FILES = ['操作守则.md', '数据目录.md', '操作日志.md', '新手教程.md'];
 const DEFAULT_FOLDER = '表格工作台';
 const DEFAULT_SETTINGS = {
   folder: DEFAULT_FOLDER,
@@ -29,6 +29,7 @@ const DEFAULT_SETTINGS = {
   archiveMeta: {},
   openAfterExport: true,
   meta: {},
+  scan: null,
 };
 
 /* ====================================================================
@@ -708,10 +709,73 @@ function sheetChanges(table, map, orig) {
   const liveCols = new Set(colSrc.filter((c) => c >= 0));
   const deadCols = (map.cols0 || map.cols).filter((c) => !liveCols.has(c));
   const rows0 = map.rows0 || map.rows || [];
-  for (const c of deadCols) { if (origAt(H, c)) set(H, c, ''); for (const r of rows0) if (origAt(r, c)) set(r, c, ''); }
-  /* 删掉的行：清空它在表格范围内的值（格式保留） */
+  for (const c of deadCols) if (origAt(H, c)) set(H, c, '');
   const liveRows = new Set(table.rows.map((r) => r.__src).filter((x) => x != null && x >= 0));
-  for (const r of rows0) if (!liveRows.has(r)) for (const c of [...liveCols, ...deadCols]) if (origAt(r, c)) set(r, c, '');
+  /* 删掉的列：清空原数据行里的值（非结构变化时在这里做） */
+  const clearDeadCols = () => { for (const c of deadCols) for (const r of rows0) if (liveRows.has(r) && origAt(r, c)) set(r, c, ''); };
+  const tmplCol = (map.cols0 || map.cols).length ? (map.cols0 || map.cols)[(map.cols0 || map.cols).length - 1] : 0;
+  const newCols = new Set(target.filter((c, k) => colSrc[k] < 0));
+  /* 插在中间的新行、删掉的行：要像 Excel 一样整行插入 / 删除，下面的行跟着移动 */
+  const srcSeq = table.rows.map((r) => (r.__src != null && r.__src >= 0 ? r.__src : -1));
+  const laterSrc = new Array(srcSeq.length).fill(false);
+  for (let i = srcSeq.length - 2; i >= 0; i--) laterSrc[i] = laterSrc[i + 1] || srcSeq[i + 1] >= 0;
+  const ins = new Map(); // 原表第几行（0 起）之后 → 插入的表格行
+  let lastSrc = H;
+  srcSeq.forEach((sr, i) => {
+    if (sr >= 0) lastSrc = sr;
+    else if (laterSrc[i]) { if (!ins.has(lastSrc)) ins.set(lastSrc, []); ins.get(lastSrc).push(i); }
+  });
+  const deleted = rows0.filter((r) => !liveRows.has(r)).sort((a, b) => a - b);
+  if (ins.size || deleted.length) {
+    const insKeys = [...ins.keys()].sort((a, b) => a - b);
+    const insCum = [];
+    insKeys.reduce((acc, k) => { acc += ins.get(k).length; insCum.push(acc); return acc; }, 0);
+    const delSet = new Set(deleted);
+    const countBelow = (arr, x) => { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] < x) lo = m + 1; else hi = m; } return lo; };
+    /* r0（0 起）→ 新位置（0 起），被删 → -1 */
+    const nr0 = (r0) => {
+      if (delSet.has(r0)) return -1;
+      const k = countBelow(insKeys, r0);
+      return r0 - countBelow(deleted, r0) + (k ? insCum[k - 1] : 0);
+    };
+    const rowMap = (n1) => { const x = nr0(n1 - 1); return x < 0 ? 0 : x + 1; };
+    const insRows = new Map(); // 新位置（0 起）→ 用来抄格式的行（新位置，0 起）
+    const firstLive = srcSeq.find((x) => x >= 0);
+    for (const [after, idxs] of ins) {
+      const baseNew = nr0(after);
+      const tmplNew = after === H && firstLive != null ? nr0(firstLive) + idxs.length : baseNew;
+      idxs.forEach((ti, j) => {
+        const R = baseNew + 1 + j;
+        insRows.set(R, tmplNew > baseNew ? tmplNew : baseNew);
+        table.rows[ti].forEach((v, k) => { v = cellStr(v); if (v !== '') set(R, target[k], v); });
+      });
+    }
+    /* 原有行：按新位置比较 */
+    for (const row of table.rows) {
+      const R = row.__src;
+      if (R == null || R < 0) continue;
+      const N = nr0(R);
+      row.forEach((v, k) => { v = cellStr(v); if (v !== origAt(R, target[k])) set(N, target[k], v); });
+      for (const c of deadCols) if (origAt(R, c)) set(N, c, '');
+    }
+    /* 末尾的新行照旧接在最后（填进预先拉好的空行） */
+    let maxNew = maxRow + insCum.reduce((a, b) => Math.max(a, b), 0) + 1;
+    const newRows = [];
+    srcSeq.forEach((sr, i) => {
+      if (sr >= 0 || laterSrc[i]) return;
+      const R = ++maxNew;
+      newRows.push(R);
+      table.rows[i].forEach((v, k) => { v = cellStr(v); if (v !== '') set(R, target[k], v); });
+    });
+    const lastLive = [...liveRows].sort((a, b) => b - a)[0];
+    const tmplRow = lastLive != null ? nr0(lastLive) : H;
+    const insAfter = new Map([...ins].map(([k, v]) => [k + 1, v.length]));
+    const dataRows = new Set(rows0.map((r) => r + 1));
+    return { changes, newRows: new Set(newRows), newCols, tmplRow, tmplCol, maxRow: maxNew, maxCol, headerRow: H, tableCols: target, rowMap, insRows, insAfter, dataRows, inserted: [...ins.values()].reduce((a, x) => a + x.length, 0), deleted: deleted.length };
+  }
+  clearDeadCols();
+  /* 删掉的行：只在末尾时清空它的值（格式保留） */
+  for (const r of deleted) for (const c of [...liveCols, ...deadCols]) if (origAt(r, c)) set(r, c, '');
   /* 现有行 / 新行 */
   const tmplRow = rows0.length ? rows0[rows0.length - 1] : H;
   const newRows = [];
@@ -725,8 +789,135 @@ function sheetChanges(table, map, orig) {
       else if (v !== origAt(R, target[k])) set(R, target[k], v);
     });
   }
-  const tmplCol = (map.cols0 || map.cols).length ? (map.cols0 || map.cols)[(map.cols0 || map.cols).length - 1] : 0;
-  return { changes, newRows: new Set(newRows), newCols: new Set(target.filter((c, k) => colSrc[k] < 0)), tmplRow, tmplCol, maxRow, maxCol, headerRow: H, tableCols: target };
+  return { changes, newRows: new Set(newRows), newCols, tmplRow, tmplCol, maxRow, maxCol, headerRow: H, tableCols: target };
+}
+
+/* ====================================================================
+ * 插入 / 删除行：像 Excel 一样把下面的行整体移动，公式、合并单元格、
+ * 图片、批注、条件格式、数据验证、其它工作表的引用都跟着调整
+ * ==================================================================== */
+/** map(行号1起) → 新行号；0 表示这一行被删掉了 */
+function makeRowShifter(map, insAfter, dataRows) {
+  const near = (n, lim, step) => {
+    for (let k = n, i = 0; step > 0 ? k <= lim : k >= lim; k += step, i++) {
+      const m = map(k);
+      if (m) return m;
+      if (i > 5000) return map(lim) || 0;
+    }
+    return 0;
+  };
+  const range = (a, b) => {
+    if (a > b) [a, b] = [b, a];
+    let s = near(a, b, 1), e = near(b, a, -1);
+    if (!(s && e && s <= e)) return null;
+    /* 紧贴着数据区域的首尾插入新行时，把区域扩大到新行（合计、条件格式等会包含新数据） */
+    if (insAfter && dataRows && b > a) {
+      const kEnd = insAfter.get(b);
+      if (kEnd && dataRows.has(b) && map(b)) e = map(b) + kEnd;
+      const kStart = insAfter.get(a - 1);
+      if (kStart && dataRows.has(a) && map(a)) s = map(a) - kStart;
+    }
+    return [s, e];
+  };
+  return { map, range };
+}
+
+const SHEET_PREFIX = "(?:'(?:[^']|'')+'|[^\\s!'\"(),:;=+\\-*/&<>^%{}\\[\\]]+)!";
+const REF_PRE = '(^|[\\s(),;=+\\-*/&<>^%{}\\[\\]"])';
+const REF_RE = new RegExp(REF_PRE + '(' + SHEET_PREFIX + ')?(\\$?)([A-Z]{1,3})(\\$?)(\\d+)(?::(\\$?)([A-Z]{1,3})(\\$?)(\\d+))?(?![0-9A-Za-z_(!])', 'g');
+const ROWREF_RE = new RegExp(REF_PRE + '(' + SHEET_PREFIX + ')?(\\$?)(\\d+):(\\$?)(\\d+)(?![0-9A-Za-z_(!:])', 'g');
+const unq = (p) => (p ? p.slice(0, -1).replace(/^'(.*)'$/, '$1').replace(/''/g, "'") : '');
+
+/** 改公式里的行号。own=true：没写工作表名的引用算这张表的；sheet：要改的那张表的名字 */
+function remapFormula(text, sh, sheet, own) {
+  if (!text) return text;
+  const hit = (prefix) => (prefix ? unq(prefix) === sheet : own);
+  return text.split(/("(?:[^"]|"")*"|&quot;[\s\S]*?&quot;)/).map((part, i) => {
+    if (i % 2) return part;
+    part = part.replace(REF_RE, (m, pre, px, d1, c1, d2, r1, d3, c2, d4, r2) => {
+      if (!hit(px)) return m;
+      px = px || '';
+      if (r2 == null) { const n = sh.map(+r1); return n ? `${pre}${px}${d1}${c1}${d2}${n}` : `${pre}${px}#REF!`; }
+      const rg = sh.range(+r1, +r2);
+      return rg ? `${pre}${px}${d1}${c1}${d2}${rg[0]}:${d3}${c2}${d4}${rg[1]}` : `${pre}${px}#REF!`;
+    });
+    return part.replace(ROWREF_RE, (m, pre, px, d1, r1, d2, r2) => {
+      if (!hit(px)) return m;
+      const rg = sh.range(+r1, +r2);
+      return rg ? `${pre}${px || ''}${d1}${rg[0]}:${d2}${rg[1]}` : `${pre}${px || ''}#REF!`;
+    });
+  }).join('');
+}
+
+/** XML 元素里的公式：先还原转义字符（中文表名常写成 &#35746; 这种），改完再转义回去 */
+function remapXmlFormula(text, sh, sheet, own) {
+  if (!text) return text;
+  const raw = text.indexOf('&') >= 0 ? xmlUnescape(text.replace(/&amp;/g, '\u0000AMP\u0000')).replace(/\u0000AMP\u0000/g, '&') : text;
+  const out = remapFormula(raw, sh, sheet, own);
+  return out === raw ? text : xmlEscape(out);
+}
+
+/** 改 "A1:B5 C7" 这样的区域列表；返回 '' 表示全部被删掉 */
+function remapSqref(sq, sh) {
+  return String(sq).split(/\s+/).filter(Boolean).map((one) => {
+    const m = /^([A-Z]{1,3})(\d+)(?::([A-Z]{1,3})(\d+))?$/.exec(one.replace(/\$/g, ''));
+    if (!m) return one;
+    if (!m[3]) { const n = sh.map(+m[2]); return n ? `${m[1]}${n}` : ''; }
+    const rg = sh.range(+m[2], +m[4]);
+    return rg ? `${m[1]}${rg[0]}:${m[3]}${rg[1]}` : '';
+  }).filter(Boolean).join(' ');
+}
+
+/** 工作表 XML 里 sheetData 以外的部分：合并单元格、条件格式、数据验证、超链接、筛选、选区、分页符… */
+function remapSheetExtras(xml, sh) {
+  const sdStart = xml.indexOf('<sheetData');
+  const sdEndTag = xml.indexOf('</sheetData>');
+  const sdEnd = sdEndTag >= 0 ? sdEndTag + 12 : xml.indexOf('>', sdStart) + 1;
+  const fix = (s) => s
+    .replace(/<mergeCell\b[^>]*\bref="([^"]+)"[^>]*\/>/g, (all, ref) => { const r = remapSqref(ref, sh); return r && r.includes(':') && !/^([A-Z]+)(\d+):\1\2$/.test(r) ? all.replace(ref, r) : ''; })
+    .replace(/(<(?:conditionalFormatting|dataValidation|selection|ignoredError|protectedRange)\b[^>]*\bsqref=")([^"]+)(")/g, (all, a, ref, b) => a + (remapSqref(ref, sh) || 'A1') + b)
+    .replace(/(<(?:hyperlink|autoFilter|dimension)\b[^>]*\bref=")([^"]+)(")/g, (all, a, ref, b) => a + (remapSqref(ref, sh) || ref) + b)
+    .replace(/(\b(?:activeCell|topLeftCell)=")([A-Z]+)(\d+)(")/g, (all, a, c, r, b) => a + c + (sh.map(+r) || r) + b)
+    .replace(/(<(?:formula|formula1|formula2)\b[^>]*>)([\s\S]*?)(<\/(?:formula|formula1|formula2)>)/g, (all, a, f, b) => a + remapXmlFormula(f, sh, '', true) + b)
+    .replace(/<rowBreaks\b[\s\S]*?<\/rowBreaks>/g, (blk) => blk.replace(/(<brk\b[^>]*\bid=")(\d+)(")/g, (all, a, id, b) => a + (sh.map(+id) || id) + b));
+  let out = fix(xml.slice(0, sdStart)) + xml.slice(sdStart, sdEnd) + fix(xml.slice(sdEnd));
+  out = out.replace(/<mergeCells\b([^>]*)>([\s\S]*?)<\/mergeCells>/, (all, attrs, inner) => {
+    const n = (inner.match(/<mergeCell\b/g) || []).length;
+    return n ? `<mergeCells count="${n}">${inner}</mergeCells>` : '';
+  });
+  return out;
+}
+
+/** 图片 / 图表的位置（drawing XML，行号从 0 起） */
+function remapDrawing(xml, sh) {
+  return xml.replace(/<((?:\w+:)?)(twoCellAnchor|oneCellAnchor)\b[\s\S]*?<\/\1\2>/g, (anchor, ns) => {
+    let fromRow = null, newFrom = null;
+    const rowTag = (part) => new RegExp('(<' + ns + part + '>[\\s\\S]*?<' + ns + 'row>)(\\d+)(</' + ns + 'row>)');
+    anchor = anchor.replace(rowTag('from'), (all, a, r, b) => {
+      fromRow = +r;
+      let n = sh.map(fromRow + 1);
+      if (!n) { const rg = sh.range(fromRow + 1, fromRow + 200000); n = rg ? rg[0] : fromRow + 1; }
+      newFrom = n - 1;
+      return a + newFrom + b;
+    });
+    anchor = anchor.replace(rowTag('to'), (all, a, r, b) => {
+      let n = sh.map(+r + 1);
+      if (!n) n = (newFrom != null ? newFrom + (+r - fromRow) : +r) + 1;
+      return a + Math.max(n - 1, newFrom || 0) + b;
+    });
+    return anchor;
+  });
+}
+
+/** 旧式批注的显示框位置（VML，行号从 0 起） */
+function remapVml(xml, sh) {
+  return xml
+    .replace(/(<x:Row>)(\d+)(<\/x:Row>)/g, (all, a, r, b) => a + ((sh.map(+r + 1) || +r + 1) - 1) + b)
+    .replace(/(<x:Anchor>\s*)([^<]+)(<\/x:Anchor>)/g, (all, a, v, b) => {
+      const p = v.split(',').map((x) => x.trim());
+      if (p.length === 8) { p[2] = String((sh.map(+p[2] + 1) || +p[2] + 1) - 1); p[6] = String((sh.map(+p[6] + 1) || +p[6] + 1) - 1); }
+      return a + p.join(', ') + b;
+    });
 }
 
 /** 公式整体平移（复制到新行时用）：$ 锁定的部分不动，引号里的文字不动 */
@@ -742,7 +933,9 @@ function shiftFormula(f, dr, dc) {
 function patchSheetXml(xml, ch, dateStyles) {
   const { changes, newCols, tmplCol } = ch;
   let { newRows, tmplRow } = ch;
-  if (!changes.size) return { xml, formulasDropped: 0 };
+  if (!changes.size && !ch.rowMap) return { xml, formulasDropped: 0 };
+  const sh = ch.rowMap ? makeRowShifter(ch.rowMap, ch.insAfter, ch.dataRows) : null;
+  if (sh) xml = remapSheetExtras(xml, sh);
   const sdStart = xml.indexOf('<sheetData');
   const sdOpenEnd = xml.indexOf('>', sdStart) + 1;
   const selfClosing = xml[sdOpenEnd - 2] === '/';
@@ -764,6 +957,36 @@ function patchSheetXml(xml, ch, dateStyles) {
     order.push(rn);
     return '';
   });
+  /* 整行插入 / 删除：行号、单元格地址、公式里的引用都换成新的 */
+  const preKill = new Set();
+  if (sh) {
+    const moved = new Map(), mOrder = [];
+    for (const rn of order) {
+      const nr = sh.map(rn);
+      const row = rows.get(rn);
+      if (!nr) {
+        for (const cx of row.cells.values()) { const f = /<f\b([^>]*)>/.exec(cx); if (f && /t="shared"/.test(f[1]) && /\bref="/.test(f[1])) { const si = (/\bsi="(\d+)"/.exec(f[1]) || [])[1]; if (si != null) preKill.add(si); } }
+        continue;
+      }
+      const attrs = row.attrs.replace(/\br="\d+"/, `r="${nr}"`);
+      const cells = new Map();
+      for (const [c, cx] of row.cells) {
+        let nx = cx.replace(/(<c\b[^>]*\br=")([A-Z]+)\d+(")/, `$1$2${nr}$3`);
+        nx = nx.replace(/(<f\b)([^>]*?)(\/>|>([\s\S]*?)<\/f>)/, (all, a, fa, rest, text) => {
+          fa = fa.replace(/\bref="([^"]+)"/, (m, ref) => `ref="${remapSqref(ref, sh) || ref}"`);
+          if (text == null) return a + fa + rest;
+          return `${a}${fa}>${remapXmlFormula(text, sh, ch.sheetName || '', true)}</f>`;
+        });
+        cells.set(c, nx);
+      }
+      moved.set(nr, { attrs, cells });
+      mOrder.push(nr);
+    }
+    rows.clear();
+    for (const [k, v] of moved) rows.set(k, v);
+    order.length = 0;
+    order.push(...mOrder);
+  }
   const styleOf = (cx) => (cx && (/\bs="(\d+)"/.exec(cx) || [])[1]) || null;
   const hasContent = (cx) => !/<f\b/.test(cx) && /<v>[^<]|<is>/.test(cx);
 
@@ -824,10 +1047,10 @@ function patchSheetXml(xml, ch, dateStyles) {
     }
     if (!cols.size) changes.delete(r0);
   }
-  if (!changes.size) return { xml, formulasDropped: 0 };
+  if (!changes.size && !sh) return { xml, formulasDropped: 0 };
 
   /* 被改动单元格如果是共享公式的主格，整组共享公式转成数值，避免文件损坏 */
-  const killSi = new Set();
+  const killSi = new Set(preKill);
   for (const [r0, cols] of changes) {
     const row = rows.get(r0 + 1);
     if (!row) continue;
@@ -872,7 +1095,8 @@ function patchSheetXml(xml, ch, dateStyles) {
     for (const [c, v] of cols) {
       const ref = colLetter(c) + rn;
       const old = row.cells.get(c);
-      const s = styleOf(old) || (newRows.has(r0) || newCols.has(c) ? tmplStyle(rn, c) : null);
+      const insT = ch.insRows && ch.insRows.get(r0);
+      const s = styleOf(old) || (insT != null ? styleOf((rows.get(insT + 1) || { cells: new Map() }).cells.get(c)) || tmplStyle(rn, c) : newRows.has(r0) || newCols.has(c) ? tmplStyle(rn, c) : null);
       row.cells.set(c, cellXml(ref, s, v));
       if (c > maxC) maxC = c;
     }
@@ -885,7 +1109,7 @@ function patchSheetXml(xml, ch, dateStyles) {
     const f = /<f\b([^>]*)>([\s\S]*?)<\/f>/.exec(cx);
     if (f && /t="shared"/.test(f[1]) && /\bref="/.test(f[1])) { const si = (/\bsi="(\d+)"/.exec(f[1]) || [])[1]; if (si != null && !masters.has(si)) masters.set(si, { text: f[2], rn, c }); }
   }
-  const formulaFor = (cx, c, rn) => {
+  const formulaFor = (cx, c, rn, tpRn) => {
     const f = /<f\b([^>]*?)(?:\/>|>([\s\S]*?)<\/f>)/.exec(cx || '');
     if (!f || /t="array"|t="dataTable"/.test(f[1])) return null;
     if (/t="shared"/.test(f[1])) {
@@ -893,7 +1117,7 @@ function patchSheetXml(xml, ch, dateStyles) {
       const m = masters.get(si);
       return m ? shiftFormula(m.text, rn - m.rn, c - m.c) : null;
     }
-    return f[2] ? shiftFormula(f[2], rn - (tmplRow + 1), 0) : null;
+    return f[2] ? shiftFormula(f[2], rn - (tpRn || tmplRow + 1), 0) : null;
   };
   const tmplCols = new Set([...(tmpl ? tmpl.cells.keys() : []), ...(ch.tableCols || [])]);
   const mergeAdd = [];
@@ -904,26 +1128,36 @@ function patchSheetXml(xml, ch, dateStyles) {
     if (+r1 === tmplRow + 1 && +r2 === +r1) tmplMerges.push([c1, c2]);
     return '';
   });
-  for (const r0 of newRows) {
-    const rn = r0 + 1;
+  const fillRow = (rn, tp, tpRn, merges1) => {
     let row = rows.get(rn);
     if (!row) { row = { attrs: ` r="${rn}"`, cells: new Map() }; rows.set(rn, row); order.push(rn); }
-    if (tmpl && row.attrs.replace(/\s*\bspans="[^"]*"/, '') === ` r="${rn}"`) {
-      row.attrs = ` r="${rn}"` + tmpl.attrs.replace(/\s*\br="\d+"/, '').replace(/\s*\bspans="[^"]*"/, '');
+    if (tp && row.attrs.replace(/\s*\bspans="[^"]*"/, '') === ` r="${rn}"`) {
+      row.attrs = ` r="${rn}"` + tp.attrs.replace(/\s*\br="\d+"/, '').replace(/\s*\bspans="[^"]*"/, '');
     }
-    for (const c of tmplCols) {
+    const cols = new Set([...(tp ? tp.cells.keys() : []), ...(ch.tableCols || [])]);
+    for (const c of cols) {
       const curCx = row.cells.get(c);
       if (curCx && /<f\b/.test(curCx)) continue; // 本来就有公式
-      const fx = tmpl && formulaFor(tmpl.cells.get(c), c, rn); // 公式列：新行也用公式，结果由 Excel 算
+      const fx = tp && formulaFor(tp.cells.get(c), c, rn, tpRn); // 公式列：新行也用公式，结果由 Excel 算
       if (!fx && curCx && /<v>|<is>/.test(curCx)) continue;
       const ref = colLetter(c) + rn;
-      const s = styleOf(curCx) || tmplStyle(rn, c);
-      if (fx) row.cells.set(c, `<c r="${ref}"${s ? ` s="${s}"` : ''}><f>${fx}</f></c>`);
-      else if (s && !row.cells.has(c)) row.cells.set(c, `<c r="${ref}" s="${s}"/>`);
+      const st = styleOf(curCx) || (tp && styleOf(tp.cells.get(c))) || tmplStyle(rn, c);
+      if (fx) row.cells.set(c, `<c r="${ref}"${st ? ` s="${st}"` : ''}><f>${fx}</f></c>`);
+      else if (st && !row.cells.has(c)) row.cells.set(c, `<c r="${ref}" s="${st}"/>`);
       if (c > maxC) maxC = c;
     }
     if (rn > maxR) maxR = rn;
-    if (!mergeRows.has(rn)) tmplMerges.forEach(([c1, c2]) => mergeAdd.push(`<mergeCell ref="${c1}${rn}:${c2}${rn}"/>`));
+    if (!mergeRows.has(rn)) merges1.forEach(([c1, c2]) => mergeAdd.push(`<mergeCell ref="${c1}${rn}:${c2}${rn}"/>`));
+  };
+  for (const r0 of newRows) fillRow(r0 + 1, tmpl, tmplRow + 1, tmplMerges);
+  /* 插在中间的新行：照它上面那一行（插在表头下面时照下面一行）的格式和公式 */
+  if (ch.insRows) {
+    for (const [r0, t0] of ch.insRows) {
+      const tp = rows.get(t0 + 1);
+      const m1 = [];
+      xml.replace(/<mergeCell\b[^>]*\bref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/g, (all, c1, r1, c2, r2) => { if (+r1 === t0 + 1 && +r2 === +r1) m1.push([c1, c2]); return ''; });
+      fillRow(r0 + 1, tp, t0 + 1, m1);
+    }
   }
   order.sort((a, b) => a - b);
   const out = [...new Set(order)].map((rn) => {
@@ -951,18 +1185,84 @@ function patchSheetXml(xml, ch, dateStyles) {
 async function patchWorkbook(srcBuf, sheets) {
   const book = await openWorkbook(srcBuf);
   const replaced = new Map();
-  let changed = 0, formulasDropped = 0;
+  let changed = 0, formulasDropped = 0, inserted = 0, deletedRows = 0;
+  const shifts = [];
   for (const sh of sheets) {
     const meta = book.sheets[sh.index];
     if (!meta) continue;
     const orig = await readSheet(book, meta);
     const ch = sheetChanges(sh.table, sh.map, orig);
-    if (!ch.changes.size) continue;
+    if (!ch.changes.size && !ch.rowMap) continue;
+    ch.sheetName = meta.name;
     const xml = await book.zip.text(meta.path);
     const r = patchSheetXml(xml, ch, book.dateStyle);
     replaced.set(meta.path, r.xml);
     for (const m of ch.changes.values()) changed += m.size;
     formulasDropped += r.formulasDropped;
+    if (ch.rowMap) { shifts.push({ name: meta.name, path: meta.path, sh: makeRowShifter(ch.rowMap, ch.insAfter, ch.dataRows) }); inserted += ch.inserted || 0; deletedRows += ch.deleted || 0; }
+  }
+  /* 整行插入 / 删除后：图片、批注、表格对象、其它工作表和图表里引用这张表的地方也要跟着移动 */
+  if (shifts.length) {
+    const zip = book.zip;
+    const textOf = async (p) => (replaced.has(p) ? replaced.get(p) : zip.has(p) ? zip.text(p) : null);
+    const relsOf = (p) => p.replace(/([^/]+)$/, '_rels/$1.rels');
+    const resolve = (base, target) => {
+      if (target.startsWith('/')) return target.slice(1);
+      const parts = base.split('/').slice(0, -1);
+      for (const seg of target.split('/')) { if (seg === '..') parts.pop(); else if (seg !== '.') parts.push(seg); }
+      return parts.join('/');
+    };
+    for (const sf of shifts) {
+      const rels = await textOf(relsOf(sf.path));
+      if (!rels) continue;
+      const targets = [];
+      rels.replace(/<Relationship\b[^>]*>/g, (tag) => {
+        const type = (/\bType="([^"]+)"/.exec(tag) || [])[1] || '';
+        const t = (/\bTarget="([^"]+)"/.exec(tag) || [])[1];
+        if (t && !/TargetMode="External"/.test(tag)) targets.push({ type: type.split('/').pop(), path: resolve(sf.path, t) });
+        return '';
+      });
+      for (const tg of targets) {
+        const x = await textOf(tg.path);
+        if (x == null) continue;
+        if (tg.type === 'drawing') replaced.set(tg.path, remapDrawing(x, sf.sh));
+        else if (tg.type === 'vmlDrawing') replaced.set(tg.path, remapVml(x, sf.sh));
+        else if (tg.type === 'comments') replaced.set(tg.path, x.replace(/<comment\b[^>]*\bref="([A-Z]+)(\d+)"[^>]*>[\s\S]*?<\/comment>/g, (all, c, r) => { const n = sf.sh.map(+r); return n ? all.replace(`ref="${c}${r}"`, `ref="${c}${n}"`) : ''; }));
+        else if (tg.type === 'table') replaced.set(tg.path, x.replace(/(<(?:table|autoFilter|sortState|sortCondition)\b[^>]*\bref=")([^"]+)(")/g, (all, a, ref, b) => a + (remapSqref(ref, sf.sh) || ref) + b).replace(/(<calculatedColumnFormula\b[^>]*>)([\s\S]*?)(<\/calculatedColumnFormula>)/g, (all, a, f, b) => a + remapXmlFormula(f, sf.sh, sf.name, false) + b));
+      }
+    }
+    const mentions = (text) => {
+      const dx = text.indexOf('&#') >= 0 ? text.replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16))).replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(+n)).replace(/&apos;/g, "'") : text.replace(/&apos;/g, "'");
+      return shifts.filter((sf) => dx.includes(sf.name + '!') || dx.includes(sf.name.replace(/'/g, "''") + "'!"));
+    };
+    const remapQualified = (text, re) => {
+      for (const sf of mentions(text)) text = text.replace(re, (all, a, f, b) => a + remapXmlFormula(f, sf.sh, sf.name, false) + b);
+      return text;
+    };
+    for (const meta of book.sheets) {
+      const x = await textOf(meta.path);
+      if (x == null || !x.includes('!') || !mentions(x).length) continue;
+      const y = remapQualified(x, /(<f\b[^>]*>)([\s\S]*?)(<\/f>)/g);
+      if (y !== x) replaced.set(meta.path, y);
+    }
+    for (const n of zip.names.filter((n) => /^xl\/charts\/chart\d*\.xml$/.test(n))) {
+      const x = await textOf(n);
+      if (!x || !mentions(x).length) continue;
+      const y = remapQualified(x, /(<c:f>)([\s\S]*?)(<\/c:f>)/g);
+      if (y !== x) replaced.set(n, y);
+    }
+    for (const n of zip.names.filter((n) => /^xl\/pivotCache\/pivotCacheDefinition\d*\.xml$/.test(n))) {
+      const x = await textOf(n);
+      if (!x) continue;
+      const y = x.replace(/<worksheetSource\b([^>]*)\/>/, (all, attrs) => {
+        const sheet = xmlUnescape((/\bsheet="([^"]*)"/.exec(attrs) || [])[1] || '');
+        const sf = shifts.find((z) => z.name === sheet);
+        return sf ? all.replace(/\bref="([^"]+)"/, (m, ref) => `ref="${remapSqref(ref, sf.sh) || ref}"`) : all;
+      });
+      if (y !== x) replaced.set(n, y);
+    }
+    const wb0 = await textOf('xl/workbook.xml');
+    if (wb0) { const y = remapQualified(wb0, /(<definedName\b[^>]*>)([\s\S]*?)(<\/definedName>)/g); if (y !== wb0) replaced.set('xl/workbook.xml', y); }
   }
   const removed = new Set();
   if (replaced.size) {
@@ -974,14 +1274,14 @@ async function patchWorkbook(srcBuf, sheets) {
       const rels = await book.zip.text('xl/_rels/workbook.xml.rels');
       replaced.set('xl/_rels/workbook.xml.rels', rels.replace(/<Relationship\b[^>]*Target="[^"]*calcChain\.xml"[^>]*\/>/, ''));
     }
-    let wb = await book.zip.text('xl/workbook.xml');
+    let wb = replaced.has('xl/workbook.xml') ? replaced.get('xl/workbook.xml') : await book.zip.text('xl/workbook.xml');
     if (/<calcPr\b/.test(wb)) wb = wb.replace(/<calcPr\b([^>]*?)(\/?)>/, (all, attrs, sl) => `<calcPr${attrs.replace(/\s*fullCalcOnLoad="[^"]*"/, '')} fullCalcOnLoad="1"${sl}>`);
     else if (/<\/definedNames>/.test(wb)) wb = wb.replace('</definedNames>', '</definedNames><calcPr fullCalcOnLoad="1"/>');
     else wb = wb.replace('</sheets>', '</sheets><calcPr fullCalcOnLoad="1"/>');
     replaced.set('xl/workbook.xml', wb);
   }
   const out = await rezip(book.zip, replaced, removed);
-  return { buffer: out, changed, formulasDropped, sheetsChanged: [...replaced.keys()].filter((k) => k.startsWith('xl/worksheets/')).length };
+  return { buffer: out, changed, formulasDropped, inserted, deletedRows, sheetsChanged: [...replaced.keys()].filter((k) => /^xl\/worksheets\/[^/]+\.xml$/.test(k)).length };
 }
 
 /* ---------- XLSX 写出（不压缩的 zip，无第三方依赖） ---------- */
@@ -1577,6 +1877,121 @@ async function renderPdfPages(app, tf, width, maxPages) {
 }
 
 
+/* ====================================================================
+ * 附件 AI 扫描：识别单据上的日期，按时间分类
+ * ==================================================================== */
+const SCAN_PRESETS = {
+  deepseek: { label: 'DeepSeek', format: 'openai', url: 'https://api.deepseek.com/v1', model: 'deepseek-flash' },
+  qwen: { label: '通义千问（阿里云百炼）', format: 'openai', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-vl-max-latest' },
+  doubao: { label: '豆包（火山方舟）', format: 'openai', url: 'https://ark.cn-beijing.volces.com/api/v3', model: '' },
+  zhipu: { label: '智谱 GLM', format: 'openai', url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4v-flash' },
+  openai: { label: 'OpenAI', format: 'openai', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  claude: { label: 'Claude（Anthropic）', format: 'anthropic', url: 'https://api.anthropic.com/v1', model: 'claude-haiku-5-5' },
+  custom: { label: '其他（OpenAI 兼容接口）', format: 'openai', url: '', model: '' },
+};
+const SCAN_DEFAULTS = { provider: 'qwen', url: SCAN_PRESETS.qwen.url, key: '', model: SCAN_PRESETS.qwen.model, by: 'month', auto: true, rename: true, maxTokens: 4000, nameTpl: '{日期}_{类型}_{对方}_{单号}' };
+const scanCfg = (s) => Object.assign({}, SCAN_DEFAULTS, s.scan || {});
+const scanReady = (s) => { const c = scanCfg(s); return !!(c.key && c.url && c.model); };
+const scannable = (f) => { const k = archiveKind(f); return (k === 'image' && !/^(svg|heic)$/i.test(f.extension || '')) || k === 'pdf'; };
+/** 年月日文件夹（2026-11、2026-11/11-15）——AI 整理时会移动；自己建的分类文件夹不动 */
+const isDateFolder = (fd) => fd === '' || /^\d{4}-\d{2}(\/\d{2}-\d{2})?$/.test(fd);
+
+/** 把各种写法的日期统一成 YYYY-MM-DD 或 YYYY-MM；认不出返回 '' */
+function normDate(v) {
+  if (v == null) return '';
+  const t = String(v).trim().replace(/[年月.\/]/g, '-').replace(/[日号]/g, '').replace(/\s+/g, '');
+  const m = t.match(/^(\d{4})-(\d{1,2})(?:-(\d{1,2}))?/);
+  if (!m) return '';
+  const y = +m[1], mo = +m[2], d = m[3] ? +m[3] : 0;
+  if (y < 2000 || y > new Date().getFullYear() + 1 || mo < 1 || mo > 12 || d > 31) return '';
+  const z = (n) => String(n).padStart(2, '0');
+  return d ? `${y}-${z(mo)}-${z(d)}` : `${y}-${z(mo)}`;
+}
+
+function parseScanReply(text) {
+  const t = String(text || '').replace(/```(?:json)?/gi, '');
+  const a = t.indexOf('{'), b = t.lastIndexOf('}');
+  if (a < 0 || b < a) throw new Error('AI 没有按格式回答（回复可能被截断，可以在设置里调高回复长度上限）：' + t.slice(0, 60));
+  const o = JSON.parse(t.slice(a, b + 1));
+  const str = (x) => (x == null || x === 'null' ? '' : String(x).trim()).slice(0, 60);
+  return { date: normDate(o.date), type: str(o.type), party: str(o.party), no: str(o.no), summary: str(o.summary) };
+}
+
+/** 图片缩小到长边 1600px 再发送（省流量、省钱，识别日期足够清楚） */
+async function imageToDataUrl(app, tf) {
+  if (archiveKind(tf) === 'pdf') return (await renderPdfPages(app, tf, 1400, 1)).urls[0];
+  const buf = await app.vault.readBinary(tf);
+  const ext = (tf.extension || '').toLowerCase();
+  const blob = new Blob([buf], { type: ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'gif' ? 'image/gif' : ext === 'bmp' ? 'image/bmp' : 'image/jpeg' });
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => bad(new Error('图片打不开（格式不支持或文件损坏）')); i.src = url; });
+    const k = Math.min(1, 1600 / Math.max(img.naturalWidth || 1, img.naturalHeight || 1));
+    const cv = document.createElement('canvas');
+    cv.width = Math.max(1, Math.round(img.naturalWidth * k));
+    cv.height = Math.max(1, Math.round(img.naturalHeight * k));
+    const ctx = cv.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.drawImage(img, 0, 0, cv.width, cv.height);
+    return cv.toDataURL('image/jpeg', 0.85);
+  } finally { URL.revokeObjectURL(url); }
+}
+
+/** 调用视觉模型；image 为空时只发文字（测试连接用） */
+async function callVision(cfg, prompt, image) {
+  const base = String(cfg.url || '').trim().replace(/\/+$/, '').replace(/\/(chat\/completions|messages)$/, '');
+  const anth = (SCAN_PRESETS[cfg.provider] || {}).format === 'anthropic';
+  let url, headers, body;
+  if (anth) {
+    const content = [];
+    if (image) content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: image.split(',')[1] } });
+    content.push({ type: 'text', text: prompt });
+    url = base + '/messages';
+    headers = { 'x-api-key': cfg.key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' };
+    body = { model: cfg.model, max_tokens: cfg.maxTokens || 4000, messages: [{ role: 'user', content }] };
+  } else {
+    const content = [{ type: 'text', text: prompt }];
+    if (image) content.push({ type: 'image_url', image_url: { url: image } });
+    url = base + '/chat/completions';
+    headers = { Authorization: 'Bearer ' + cfg.key, 'Content-Type': 'application/json' };
+    body = { model: cfg.model, temperature: 0, max_tokens: cfg.maxTokens || 4000, messages: [{ role: 'user', content }] };
+  }
+  for (let attempt = 0; ; attempt++) {
+    let r;
+    try { r = await requestUrl({ url, method: 'POST', headers, body: JSON.stringify(body), throw: false }); } catch (e) {
+      if (attempt < 2) { await new Promise((ok) => setTimeout(ok, 1500 * (attempt + 1))); continue; }
+      throw new Error('连不上 API：' + (e.message || e));
+    }
+    let j = null;
+    try { j = JSON.parse(r.text); } catch (e) { /* 不是 JSON */ }
+    if ((r.status === 429 || r.status >= 500) && attempt < 3) { await new Promise((ok) => setTimeout(ok, 2500 * (attempt + 1))); continue; }
+    if (r.status >= 400) {
+      const msg = j && j.error ? (j.error.message || j.error.code || JSON.stringify(j.error)) : String(r.text || '').slice(0, 120);
+      throw new Error(`API 返回 ${r.status}：${msg}${r.status === 401 || r.status === 403 ? '（检查 API Key）' : r.status === 404 ? '（检查 API 地址和模型名）' : ''}`);
+    }
+    let text = '';
+    if (anth) text = ((j && j.content) || []).filter((c) => c.type === 'text').map((c) => c.text).join('');
+    else { const c = j && j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : ''; text = Array.isArray(c) ? c.map((x) => x.text || '').join('') : String(c || ''); }
+    return text;
+  }
+}
+
+function scanPrompt(tf, received) {
+  return `这是收到的一份文件（文件名：${tf.name}，收到日期：${received}）。请找出文件上的业务日期——开单日期、送货日期、发票日期、合同签订日期等，以单据本身写的日期为准，不是拍照或打印时间；手写的日期也要认。
+只写了月和日、没写年份的，按收到日期推断年份（不会晚于收到日期太多）。完全看不出日期就写 null。
+只输出一个 JSON，不要其它文字：
+{"date":"YYYY-MM-DD（只看得出月份就写 YYYY-MM）","type":"文件类型，例如 送货单、发票、收据、对账单、合同、聊天截图、其他","party":"对方单位或客户名称，没有写空字符串","no":"单号，没有写空字符串","summary":"不超过 20 字的说明"}`;
+}
+
+/** 按模板生成新文件名：{日期} {类型} {对方} {单号} {说明} {原名}；空的字段连同多余的分隔符一起去掉 */
+function scanFileName(tpl, r, orig) {
+  const map = { 日期: r.date, 类型: r.type, 对方: r.party, 单号: r.no, 说明: r.summary, 原名: orig };
+  let out = String(tpl || SCAN_DEFAULTS.nameTpl).replace(/\{(日期|类型|对方|单号|说明|原名)\}/g, (_, k) => safeSeg(map[k] || '').replace(/[_\s]+/g, ' ').trim());
+  out = out.replace(/([_\-\s·]){2,}/g, '$1').replace(/^[_\-\s·]+|[_\-\s·]+$/g, '');
+  return safeSeg(out).slice(0, 80);
+}
+
 /** 读取表格文件 → { table, title } */
 async function fileToTable(file, onProgress) {
   if (file.size > MAX_FILE) throw new Error(`文件超过 200MB（${(file.size / 1048576).toFixed(0)}MB）`);
@@ -2127,7 +2542,7 @@ class TableWorkbenchView extends ItemView {
       if (this.settings.autoProcess !== false) {
         try { await this.ensureAutoDirs(); this.scanAuto(); } catch (e) { console.warn('[表格工作台] 准备自动处理文件夹失败', e); }
       }
-      try { await this.writeRules(); await this.writeDataIndex(); await this.writeLogFile(); } catch (e) { console.warn('[表格工作台] 写说明文件失败', e); }
+      try { await this.writeRules(); await this.writeTutorial(); await this.writeDataIndex(); await this.writeLogFile(); } catch (e) { console.warn('[表格工作台] 写说明文件失败', e); }
       this.checkOutputs();
     }, 300);
   }
@@ -2144,7 +2559,7 @@ class TableWorkbenchView extends ItemView {
       { sel: '.ata-oplog', title: '日志', before: toTab('home'),
         text: 'AI 改了哪张表、哪些格子从什么改成什么、加了哪些行、原表是否已更新，都按时间记在这里；改错了可以点「撤销这次修改」。AI 写的处理说明也会出现在这里。' },
       { sel: '.ata-header-right', title: '操作守则', before: toTab('home'),
-        text: '「操作守则」是写给 AI 看的规则：文件放在哪、怎么改、改完怎么记录。让 AI 干活前先叫它读这份守则（点「复制守则地址」发给它）。' },
+        text: '「操作守则」是写给 AI 看的规则：文件放在哪、怎么改、改完怎么记录。让 AI 干活时，点「复制 AI 开场白」粘贴给它，后面接上你的需求就行。完整用法看「新手教程」。' },
       { sel: '.ata-fmlist', title: '文件管理', before: toTab('library'), optional: true,
         alt: { sel: '.ata-tabs', text: '导入表格后，「文件管理」里会列出每个表格文件：勾选后可以复制原表地址、复制数据地址、删除，也能看到原表 Excel 是不是最新的。' },
         text: '每个表格文件一行：勾选后可以批量复制原表地址、复制底层数据地址、删除；右边能看到原表 Excel 是不是已经更新到最新。点多工作表的 Excel 可以展开看每张表。' },
@@ -2286,10 +2701,13 @@ class TableWorkbenchView extends ItemView {
   tourDone(card) {
     card.addClass('is-wide');
     card.createDiv({ cls: 'ata-tour-title big', text: '可以开始了 🎉' });
-    card.createDiv({ cls: 'ata-tour-text', text: '先导入你平时用的 Excel，然后把「操作守则」发给 AI，让它试着加一行数据，回来看日志和原表。' });
-    card.createDiv({ cls: 'ata-tour-hint', text: '以后想再看这个引导：点顶部的「引导」按钮，或在插件设置里点「重新查看使用引导」。' });
+    card.createDiv({ cls: 'ata-tour-text', text: '先导入你平时用的 Excel，然后在「日志」页点「复制 AI 开场白」发给外部 AI，让它试着加一行数据，回来看日志和原表。怎么跟 AI 说、哪些 AI 能用，都写在「新手教程」里。' });
+    card.createDiv({ cls: 'ata-tour-hint', text: '以后想再看：顶部的「教程」打开新手教程，「引导」重看这个界面介绍。' });
     const bar = card.createDiv('ata-tour-bar');
-    const done = bar.createDiv('ata-tour-btns').createEl('button', { cls: 'mod-cta', text: '完成' });
+    const bs = bar.createDiv('ata-tour-btns');
+    const tut = bs.createEl('button', { text: '打开新手教程' });
+    tut.addEventListener('click', () => { this.endTour(true); this.openTutorial(); });
+    const done = bs.createEl('button', { cls: 'mod-cta', text: '完成' });
     done.addEventListener('click', () => this.endTour(true));
     setTimeout(() => done.focus(), 30);
   }
@@ -2539,6 +2957,7 @@ class TableWorkbenchView extends ItemView {
     top('file-up', '导入文件', () => this.fileInput.click());
     top('folder-up', '导入文件夹', () => this.folderInput.click());
     top('clipboard-paste', '按路径', () => new PathModal(this.app, this).open());
+    top('graduation-cap', '教程', () => this.openTutorial());
     top('help-circle', '引导', () => this.startTour());
     top('settings', '设置', () => {
       this.app.setting.open();
@@ -3132,6 +3551,147 @@ class TableWorkbenchView extends ItemView {
     } catch (e) { console.warn('[表格工作台] 写文件失败', name, e); }
   }
 
+  /** 发给外部 AI 的开场白：告诉它文件夹在哪、先读守则 */
+  aiOpener() {
+    const root = this.absPath(normalizePath(this.settings.folder));
+    const sep = root.includes('\\') ? '\\' : '/';
+    return `你可以读写这个文件夹：${root}
+开始前先完整阅读 ${root}${sep}操作守则.md，严格按里面的规则做：表格只改「数据」文件夹里的 CSV，不要动「表格」文件夹里的 Excel；做完在「自动处理${sep}记录」里写一条记录。
+我的需求是：`;
+  }
+
+  async writeTutorial() {
+    const root = this.absPath(normalizePath(this.settings.folder));
+    const sep = root.includes('\\') ? '\\' : '/';
+    const opener = this.aiOpener().split('\n').map((l) => '> ' + l).join('\n');
+    const text = `<!-- 表格工作台自动生成，插件更新时会刷新，手动修改会被覆盖 -->
+# 表格工作台 · 新手教程
+
+**一句话：Obsidian 负责存放、展示和记录，外部 AI 负责干活。**
+
+你把 Excel 导进来，插件会把它拆成 AI 读得快的底层数据（CSV）。你让 AI（Claude、ChatGPT、DeepSeek……）去改这些数据，插件几秒内自动生成和原表一模一样的 Excel（颜色、公式、合并单元格、图片都保留），并把每一次改动记进日志。
+
+\`\`\`
+你的 Excel ──导入──▶ 数据/（CSV，AI 读写这里）──自动生成──▶ 表格/（原生 Excel，拿去用）
+                                    │
+                                    └──▶ 日志：改了哪些格子、加了哪些行，可撤销
+\`\`\`
+
+你的表格文件夹：\`${root}\`
+
+---
+
+## 第一步：导入你的表格（1 分钟）
+
+1. 点左边栏的表格图标，打开「表格工作台」。
+2. 点顶部「导入文件」，选你平时用的 Excel（.xlsx / .xlsm / .csv）。也可以直接把文件拖进面板，或点「导入文件夹」一次导入一整个文件夹。
+3. 导入完成后去「文件管理」看看：每个工作簿一行，点开能看到每张工作表；右边能看到原表 Excel 是不是最新的。
+
+> 老版 .xls 需要先在 Excel 里「另存为」.xlsx。
+
+导入后会多出这些东西：
+
+| 位置 | 是什么 | 谁来用 |
+|---|---|---|
+| \`数据${sep}\` | 底层数据，每张工作表一个 CSV | **AI 改这里** |
+| \`表格${sep}\` | 自动生成的原生 Excel，和原表格式一样 | **你拿去用、发给别人** |
+| \`附件区${sep}\` | 你存的单据照片、截图、PDF | 你和 AI 都可以看 |
+| \`操作守则.md\` | 写给 AI 的规则 | AI 开工前先读 |
+| \`数据目录.md\` | 所有表格的清单（列名、行数、样例） | AI 用来找表 |
+| \`操作日志.md\` | 所有操作记录 | 你核对用 |
+
+---
+
+## 第二步：让外部 AI 来干活
+
+### 哪些 AI 可以用
+
+**最好用：能直接读写电脑文件的 AI。** 例如 Claude 桌面版（把文件夹添加给它）、Claude Code、Codex、Cursor、Trae 等。把上面的表格文件夹交给它，它就能直接改，改完 Excel 自动更新。
+
+**只能聊天的网页 AI 也能用，但要手动搬文件**（见本节最后）。
+
+### 给 AI 的开场白（每次新对话先发这段）
+
+在「日志」页点 **「复制 AI 开场白」**，粘贴给 AI，后面接上你的需求：
+
+${opener}
+
+开场白告诉 AI 三件事：文件在哪、先读操作守则、做完要记录。AI 读完守则就知道该怎么改、改哪里、不能动什么。
+
+### 可以这样跟 AI 说（直接照抄改一改）
+
+**录入数据**
+- 「看附件区 2026-11 文件夹里今天的送货单照片，把每张单子的日期、客户、品名、规格、数量、单价录进『送货记录』表，金额自己算好。看不清的地方列出来让我核对。」
+- 「在『！！客户』表里 11 月 15 日那几行后面插入一行：2026-11-15，华盛布行，棉布 280 克，200 米，单价 8.5。」（插在中间也可以，原表会像 Excel 一样整行插入）
+
+**修改**
+- 「把『价格表』里所有华盛布行的单价改成 8.5，金额重新算。」
+- 「删除『送货记录』里单号 0011047 那一行。」
+
+**只查不改**
+- 「统计 10 月每个客户的金额合计，只告诉我结果，不要改任何文件。」
+- 「找出『！！客户』表里金额和数量×单价对不上的行。」
+
+**导入新表**
+- 「把 D:\\下载\\11月对账单.xlsx 复制到 自动处理${sep}导入 里导入，然后告诉我生成了哪些表。」
+
+### AI 改完之后你看哪里
+
+1. **日志页**：最上面就是刚才的改动——哪张表、哪几个格子从什么改成什么、加了哪几行、原表 Excel 有没有更新，还有 AI 写的处理说明。
+2. **原表 Excel**：在「文件管理」里勾选这张表 →「复制原表地址」，或点那一行的文件夹图标「在文件夹中显示」，打开就是最新版。
+3. **改错了**：在日志里那一条上点 **「撤销这次修改」**，数据和原表 Excel 都会恢复。
+
+### 只能聊天的网页 AI 怎么用
+
+1. 在「文件管理」里勾选表格 →「复制数据地址」，找到对应的 CSV 文件，上传给 AI（大表可以只发需要的部分）。
+2. 让 AI 按「操作守则」的 CSV 规则修改，**给你返回完整的 CSV 文件**。
+3. 把 AI 给的 CSV 放回 \`数据${sep}\` 里原来的位置覆盖原文件，插件会自动生成 Excel、记录日志。
+
+---
+
+## 第三步：附件区和 AI 扫描
+
+- 收到的单据照片、截图、PDF 拖进「附件区」，或者在附件区按 Ctrl+V 粘贴。
+- 点「多选」可以批量复制文件（直接粘贴到微信）、复制路径、移动到文件夹、删除。
+- **AI 扫描**：在 设置 → 表格工作台 →「附件 AI 扫描」里选服务商（DeepSeek、通义千问、豆包、智谱、OpenAI、Claude）、填 API Key、点「测试」。之后：
+  - 新存进来的图片 / PDF 会自动识别单据上的日期，放进按月（或按日）分的文件夹；
+  - 自动改名成「2026-11-15_送货单_对方名称_单号」这样的名字；
+  - 附件区按日期分组显示，一眼能看出每天收到哪些单子；
+  - 之前存的旧附件，点附件区右上角「AI 按时间整理」一次处理完。
+
+整理好日期以后，跟外部 AI 说「把附件区 2026-11 里 11-15 那天的送货单录进表」就很准确了。
+
+---
+
+## 常见问题
+
+**原表 Excel 没更新？**
+插件只在 Obsidian 开着的时候工作，所以平时让 Obsidian 在后台开着。没开时改的，下次打开会自动补上。如果那个 Excel 正在 Excel / WPS 里打开，文件被占用，插件会等你关掉后再写——关掉 Excel 就会更新。
+
+**可以让 AI 排序或整表重写吗？**
+不要。排序会让原表里每一行的颜色、格式对不上号。插入、删除、修改单行都没问题。
+
+**可以直接改「表格」文件夹里的 Excel 吗？**
+不要，它会被自动覆盖。要改就改「数据」里的 CSV（或者让 AI 改）。原始 Excel 有了新版本，用「自动处理${sep}导入${sep}替换」重新导入。
+
+**换电脑怎么办？**
+把整个 Obsidian 库文件夹复制过去，**包括里面隐藏的 \`.ata\` 文件夹**（存着原表格式和修改历史），再装上插件即可。
+
+**API Key 安全吗？**
+只保存在这台电脑这个库的插件设置里，图片只发给你选的服务商。表格内容不会经过插件发给任何 AI——表格是外部 AI 自己读的。
+
+**想再看一遍界面介绍？**
+点工作台顶部的「引导」。
+`;
+    await this.writeDoc('新手教程.md', text);
+  }
+
+  async openTutorial() {
+    await this.writeTutorial();
+    const f = this.app.vault.getAbstractFileByPath(normalizePath(`${this.settings.folder}/新手教程.md`));
+    if (f instanceof TFile) await this.app.workspace.getLeaf('tab').openFile(f);
+  }
+
   async writeRules() {
     const root = normalizePath(this.settings.folder);
     const abs = this.absPath(root);
@@ -3150,7 +3710,7 @@ class TableWorkbenchView extends ItemView {
 | \`数据目录.md\` | 所有表格的清单：文件位置、列名、行数、样例 | 只读，先看它找表 |
 | \`数据${sep}\` | **表格的底层数据**，每个工作表一个 CSV 文件；多工作表的 Excel 是一个子文件夹 | **读写这里** |
 | \`表格${sep}\` | 自动生成的原生 Excel（和数据一一对应，保留原表的颜色、公式、合并单元格、图片） | 只读，不要改，会被覆盖 |
-| \`附件区${sep}\` | 用户存的单据、截图、PDF、价格表，按文件夹分类 | 只读 |
+| \`附件区${sep}\` | 用户存的单据、截图、PDF、价格表。开了 AI 扫描时按单据日期放在 \`年-月\`（或 \`年-月${sep}月-日\`）文件夹里，文件名是「日期_类型_对方_单号」 | 只读 |
 | \`自动处理${sep}\` | 导入新 Excel、请求导出、写操作记录（见第 4、5 节） | 按说明使用 |
 | \`操作日志.md\` | 插件自动记录的所有操作，最新的在最上面 | 只读，可用来了解之前做过什么 |
 | \`.ata${sep}\` | 插件内部数据 | **不要读写** |
@@ -3166,7 +3726,9 @@ class TableWorkbenchView extends ItemView {
 
 - UTF-8 编码；第一行是表头；字段里有逗号、引号或换行时用英文双引号包起来，内部的双引号写成两个 \`""\`。
 - **不要改表头**（列名、列的顺序），除非用户明确要求；需要新列时加在最后一列后面。
-- **新增的行加在表格末尾**；不要调整已有行的顺序；用户要求删除时才删行。
+- **新增的行可以放在任意位置**：按日期、客户等顺序插在该在的地方，或者加在末尾都行。生成原表时会像 Excel 一样整行插入，下面的行、公式、合并单元格、图片、批注都跟着下移；紧挨着数据首尾插入时，合计公式的范围会自动包含新行。
+- 用户要求删除时才删行；删除也会整行删掉，下面的行往上移。
+- **不要调整已有行的先后顺序**（不要排序、不要整表重写），否则原表里的颜色和格式会对不上。
 - 只改需要改的格子，其它内容保持原样（包括空格子和原来的写法）。
 - 日期写成 \`YYYY-MM-DD\`（或照搬这一列已有的写法）；数字不要加千分位逗号和货币符号。
 - 需要计算的（金额 = 数量 × 单价、合计等）请自己算好再写进去：CSV 里没有公式，导出时原表里已有的公式会保留，新增行会沿用上一行的公式。
@@ -3729,9 +4291,10 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     left.createDiv({ cls: 'ata-sub', text: '每一次修改（改了哪些格子、加了哪些行）、原表 Excel 的自动更新、导入、删除、处理说明都记在这里，同时写进表格文件夹里的「操作日志.md」。' });
     const right = head.createDiv('ata-header-right');
     const openDoc = (name) => { const f = this.app.vault.getAbstractFileByPath(normalizePath(`${this.settings.folder}/${name}`)); if (f instanceof TFile) this.app.workspace.getLeaf('tab').openFile(f); else new Notice('还没生成，稍等几秒。'); };
-    this.btn(right, '操作守则', 'book-open-check', () => openDoc('操作守则.md'));
     this.btn(right, '数据目录', 'list-tree', () => openDoc('数据目录.md'));
-    this.btn(right, '复制守则地址', 'copy', () => this.copyText(this.absPath(normalizePath(`${this.settings.folder}/操作守则.md`)), '操作守则的地址'));
+    this.btn(right, '新手教程', 'graduation-cap', () => this.openTutorial());
+    this.btn(right, '操作守则', 'book-open-check', () => openDoc('操作守则.md'));
+    this.btn(right, '复制 AI 开场白', 'clipboard-copy', () => this.copyText(this.aiOpener(), 'AI 开场白（粘贴给 AI，后面接上你的需求）'), 'mod-cta');
     this.renderOpLog(body);
   }
 
@@ -3740,7 +4303,8 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     const dir = this.archiveDir() + '/';
     const set = new Set((this.settings.archiveFolders || []).filter(Boolean));
     this.archiveFiles().forEach((f) => { const rel = f.path.slice(dir.length); if (rel.includes('/')) set.add(rel.slice(0, rel.lastIndexOf('/'))); });
-    return [...set].sort((a, b) => (/^\d{4}-\d{2}$/.test(a) === /^\d{4}-\d{2}$/.test(b) ? (/^\d{4}-\d{2}$/.test(a) ? b.localeCompare(a) : a.localeCompare(b, 'zh-Hans-CN')) : /^\d{4}-\d{2}$/.test(a) ? 1 : -1));
+    const dt = (x) => /^\d{4}-\d{2}(\/|$)/.test(x);
+    return [...set].sort((a, b) => (dt(a) === dt(b) ? (dt(a) ? b.localeCompare(a) : a.localeCompare(b, 'zh-Hans-CN')) : dt(a) ? 1 : -1));
   }
 
   folderOf(tf) {
@@ -5205,6 +5769,8 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     const fresh = saved.length - dup;
     if (fresh > 0) this.logOp({ type: 'archive', text: `存入附件区 ${fresh} 个文件${from ? `（${from}）` : ''}`, items: saved.slice(saved.length - fresh).map((f) => f.name) });
     if (this.tab === 'archive') await this.render();
+    const newOnes = saved.filter((f) => meta[f.path] && !meta[f.path].scan && Date.now() - meta[f.path].added < 600000 && scannable(f));
+    if (newOnes.length && scanCfg(this.settings).auto && scanReady(this.settings)) this.scanArchive(newOnes, true);
     return saved;
   }
 
@@ -5241,6 +5807,117 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     setTimeout(() => io.observe(box), 0);
   }
 
+  /* ================= 附件 AI 扫描 ================= */
+  dateFolderFor(date) {
+    if (!date) return '';
+    const ym = date.slice(0, 7);
+    if (scanCfg(this.settings).by === 'day' && date.length === 10) return `${ym}/${date.slice(5)}`;
+    return ym;
+  }
+
+  openScanSettings() {
+    new Notice('先在设置里填好「附件 AI 扫描」（选服务商、填 API Key）。');
+    try { this.app.setting.open(); this.app.setting.openTabById(this.plugin.manifest.id); } catch (e) { /* 旧版本 */ }
+  }
+
+  /** 确认后扫描；force=true 时已经识别过的也重新识别 */
+  askScan(files, force) {
+    if (!scanReady(this.settings)) { this.openScanSettings(); return; }
+    const meta = this.settings.archiveMeta || {};
+    const ok = files.filter(scannable);
+    const todo = ok.filter((f) => force || !(meta[f.path] && meta[f.path].scan && meta[f.path].scan.date));
+    const skipped = files.length - ok.length;
+    if (!todo.length) { new Notice(skipped && !ok.length ? `选中的 ${skipped} 个文件不是图片或 PDF，AI 识别不了。` : '这里的图片 / PDF 都已经识别过了。要重新识别，点「多选」选中后再点「AI 识别日期」。'); return; }
+    const c = scanCfg(this.settings);
+    const how = c.by === 'day' ? '按「年-月 / 月-日」文件夹' : '按「年-月」文件夹';
+    new ConfirmModal(this.app, `AI 识别 ${todo.length} 个文件的日期并按时间归类？`,
+      `会把图片发给「${(SCAN_PRESETS[c.provider] || {}).label || c.url}」（模型 ${c.model}）识别单据上的日期，然后${how}整理${c.rename ? '，并按识别内容改名（格式：' + c.nameTpl + '）' : ''}。\n在你自己建的分类文件夹（不是日期文件夹）里的文件只记录日期，不移动。${skipped ? `\n${skipped} 个不是图片 / PDF 的文件跳过。` : ''}`,
+      [{ text: `开始识别 ${todo.length} 个`, cta: true, onClick: () => this.scanArchive(todo) }]).open();
+  }
+
+  /** 识别日期 → 记在附件信息里 → 移到日期文件夹（可选重命名） */
+  async scanArchive(files, quiet) {
+    const cfg = scanCfg(this.settings);
+    if (!scanReady(this.settings) || !files.length) return;
+    if (this.scanRunning) { this.scanQueue = (this.scanQueue || []).concat(files); if (!quiet) new Notice('正在识别上一批，这批排在后面。'); return; }
+    this.scanRunning = true;
+    const meta = this.settings.archiveMeta || (this.settings.archiveMeta = {});
+    const notice = new Notice(`AI 正在识别附件日期 0/${files.length}…`, 0);
+    const res = [];
+    let done = 0, next = 0;
+    const z = (n) => String(n).padStart(2, '0');
+    const worker = async () => {
+      while (next < files.length) {
+        const tf = files[next++];
+        const m = meta[tf.path] || (meta[tf.path] = { added: tf.stat.ctime || Date.now() });
+        try {
+          const rc = new Date(m.added || tf.stat.ctime || tf.stat.mtime || Date.now());
+          const img = await imageToDataUrl(this.app, tf);
+          const r = parseScanReply(await callVision(cfg, scanPrompt(tf, `${rc.getFullYear()}-${z(rc.getMonth() + 1)}-${z(rc.getDate())}`), img));
+          m.scan = Object.assign(r, { at: Date.now(), model: cfg.model });
+          if (!m.note) m.note = [r.type, r.party, r.no].filter(Boolean).join(' ');
+          res.push({ tf, r, name0: tf.name });
+        } catch (e) {
+          m.scan = { error: String(e.message || e).slice(0, 160), at: Date.now() };
+          res.push({ tf, err: m.scan.error, name0: tf.name });
+          if (/检查 API Key|连不上/.test(m.scan.error)) next = files.length; // Key 错了或断网就停下
+        }
+        done++;
+        try { notice.setMessage(`AI 正在识别附件日期 ${done}/${files.length}…`); } catch (e) { /* 忽略 */ }
+      }
+    };
+    try {
+      await Promise.all([worker(), worker(), worker()]);
+      const moved = {};
+      let renamed = 0;
+      this.archiving = true;
+      try {
+        for (const { tf, r } of res) {
+          if (!r || !this.app.vault.getAbstractFileByPath(tf.path)) continue;
+          if (!r.date && !(cfg.rename && (r.party || r.no))) continue;
+          const cur = this.folderOf(tf);
+          const target = r.date && isDateFolder(cur) ? this.dateFolderFor(r.date) : cur;
+          const base0 = tf.basename || tf.name.replace(/\.[^.]+$/, '');
+          let base = base0;
+          if (cfg.rename) base = scanFileName(cfg.nameTpl, r, (meta[tf.path] && meta[tf.path].origName) || base0) || base0;
+          if (cfg.rename && meta[tf.path] && !meta[tf.path].origName && base !== base0) meta[tf.path].origName = base0;
+          if (target === cur && base === base0) continue;
+          const dest = target ? `${this.archiveDir()}/${target}` : this.archiveDir();
+          await this.ensureFolder(dest);
+          const np = await this.uniquePath(dest, base, tf.extension || 'bin');
+          const old = tf.path;
+          await this.app.fileManager.renameFile(tf, np);
+          if (meta[old]) { meta[np] = meta[old]; delete meta[old]; }
+          if (this.archSel && this.archSel.has(old)) { this.archSel.delete(old); this.archSel.add(np); }
+          if (target !== cur) moved[target || '附件区'] = (moved[target || '附件区'] || 0) + 1;
+          if (base !== base0) renamed++;
+        }
+      } finally { this.archiving = false; }
+      await this.plugin.saveSettings();
+      const ok = res.filter((x) => x.r && x.r.date).length;
+      const noDate = res.filter((x) => x.r && !x.r.date).length;
+      const bad = res.filter((x) => x.err);
+      const where = Object.entries(moved).sort().map(([k, n]) => `${k}（${n}）`).join('、');
+      const parts = [`识别出 ${ok} 个日期`];
+      if (where) parts.push(`归入 ${where}`);
+      if (renamed) parts.push(`改名 ${renamed} 个`);
+      if (noDate) parts.push(`${noDate} 个看不出日期`);
+      if (bad.length) parts.push(`${bad.length} 个失败`);
+      if (files.length > res.length) parts.push(`${files.length - res.length} 个没识别（已停止）`);
+      try { notice.hide(); } catch (e) { /* 忽略 */ }
+      new Notice('AI 扫描完成：' + parts.join('，') + (bad.length ? `\n失败原因：${bad[0].err}` : ''), bad.length ? 12000 : 6000);
+      this.logOp({ type: 'archive', text: `AI 扫描 ${res.length} 个附件：${parts.join('，')}`, items: res.map((x) => `${x.name0}${x.r ? `：${x.r.date || '无日期'}${x.r.type ? ' ' + x.r.type : ''}${x.tf.name !== x.name0 ? ' → ' + (this.folderOf(x.tf) ? this.folderOf(x.tf) + '/' : '') + x.tf.name : ''}` : '：失败（' + x.err + '）'}`) });
+    } finally {
+      this.scanRunning = false;
+      try { notice.hide(); } catch (e) { /* 忽略 */ }
+    }
+    if (this.tab === 'archive') await this.render();
+    const q = this.scanQueue;
+    this.scanQueue = null;
+    if (q && q.length) await this.scanArchive(q.filter((f) => this.app.vault.getAbstractFileByPath(f.path)), true);
+  }
+
+
   renderArchive(body) {
     const wrap = body.createDiv('ata-archive');
     const all = this.archiveFiles();
@@ -5254,6 +5931,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     left.createDiv({ cls: 'ata-sub', text: `${all.length} 个文件 · 共 ${fmtSize(all.reduce((a, f) => a + f.stat.size, 0))} · 收到的单据、截图、PDF、Excel 都可以存在这里，可以新建文件夹分类` });
     const right = head.createDiv('ata-header-right');
     this.btn(right, this.archSelect ? '完成' : '多选', this.archSelect ? 'check' : 'list-checks', () => { this.archSelect = !this.archSelect; this.archSel.clear(); this.render(); });
+    this.btn(right, 'AI 按时间整理', 'sparkles', () => this.askScan(this.archSelect && this.archSel.size ? all.filter((f) => this.archSel.has(f.path)) : this.archList || all, this.archSelect && this.archSel.size > 0));
     this.btn(right, '打开文件夹', 'folder-open', async () => { const d = this.archFolder ? `${this.archiveDir()}/${this.archFolder}` : this.archiveDir(); await this.ensureFolder(d); this.showInSystem(d); });
     this.btn(right, '上传文件', 'upload', () => this.archiveInput.click(), 'mod-cta');
 
@@ -5317,9 +5995,26 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     const q = fbar.createEl('input', { cls: 'ata-archive-search', attr: { type: 'text', placeholder: '搜索文件名、备注…' } });
     q.value = this.archQuery || '';
     let list = all.filter((f) => (!this.archKind || archiveKind(f) === this.archKind) && (!this.archFolder || inFolder(f, this.archFolder)));
+    const docDate = (f) => { const x = meta[f.path] && meta[f.path].scan; return (x && x.date) || ''; };
+    const z2 = (n) => String(n).padStart(2, '0');
+    const recvDay = (f) => { const d = new Date((meta[f.path] && meta[f.path].added) || f.stat.ctime || f.stat.mtime); return `${d.getFullYear()}-${z2(d.getMonth() + 1)}-${z2(d.getDate())}`; };
+    const hasDoc = all.some((f) => docDate(f));
+    const mode = this.archSort || (hasDoc ? 'doc' : 'recv');
+    /* 按日期分组：同一天的放在一起，中间用日期标题隔开 */
+    const groupKey = mode === 'doc' ? (f) => docDate(f) || '~' : recvDay;
+    list = list.slice().sort((a, b) => { const ka = groupKey(a), kb = groupKey(b); return ka === kb ? b.stat.ctime - a.stat.ctime : ka === '~' ? 1 : kb === '~' ? -1 : kb.localeCompare(ka); });
+    this.archList = list;
+    const sortbar = fbar.createDiv('ata-catbar ata-sortbar');
+    [['按单据日期分组', 'doc'], ['按收到日期分组', 'recv']].forEach(([label, k]) => {
+      if (k === 'doc' && !hasDoc) return;
+      const b = sortbar.createEl('button', { cls: 'ata-catchip' + (mode === k ? ' is-active' : ''), text: label });
+      b.addEventListener('click', () => { this.archSort = k; this.render(); });
+    });
     const applyQ = () => {
       const s = (this.archQuery || '').toLowerCase();
-      grid.querySelectorAll('.ata-acard').forEach((c) => { c.style.display = !s || c.dataset.q.includes(s) ? '' : 'none'; });
+      const vis = new Set();
+      grid.querySelectorAll('.ata-acard').forEach((c) => { const on = !s || c.dataset.q.includes(s); c.style.display = on ? '' : 'none'; if (on) vis.add(c.dataset.g); });
+      grid.querySelectorAll('.ata-agroup').forEach((h) => { h.style.display = vis.has(h.dataset.g) ? '' : 'none'; });
     };
     q.addEventListener('input', () => { this.archQuery = q.value.trim(); applyQ(); });
 
@@ -5332,6 +6027,7 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
       this.btn(sb, '复制文件', 'files', () => { const s = sel(); if (s.length) this.copyFiles(s.map((f) => f.path)); }, 'ata-btn-sm mod-cta');
       this.btn(sb, '复制路径', 'copy', () => { const s = sel(); if (s.length) this.copyPaths(s.map((f) => f.path), '路径'); }, 'ata-btn-sm');
       this.btn(sb, '移动到…', 'folder-input', () => { const s = sel(); if (s.length) this.pickArchiveFolder((fd) => this.moveArchive(s, fd)); }, 'ata-btn-sm');
+      this.btn(sb, 'AI 识别日期', 'sparkles', () => { const s = sel(); if (s.length) this.askScan(s, true); }, 'ata-btn-sm');
       this.btn(sb, '删除所选', 'trash-2', () => {
         const s = sel();
         if (!s.length) return;
@@ -5340,16 +6036,45 @@ Obsidian 打开着的时候，往这里放文件就会自动处理，其它程�
     }
 
     const grid = wrap.createDiv('ata-agrid');
-    list.slice(0, 600).forEach((f) => {
+    const WEEK = '日一二三四五六';
+    const shown = list.slice(0, 600);
+    const groupCount = {};
+    shown.forEach((f) => { const k = groupKey(f); groupCount[k] = (groupCount[k] || 0) + 1; });
+    let lastKey = null, gi = 0;
+    shown.forEach((f) => {
+      const gk = groupKey(f);
+      if (gk !== lastKey) {
+        lastKey = gk; gi++;
+        const gh = grid.createDiv({ cls: 'ata-agroup' + (gk === '~' ? ' is-none' : ''), attr: { 'data-g': String(gi) } });
+        this.ico(gh, gk === '~' ? 'help-circle' : 'calendar-days');
+        let label = gk;
+        if (gk === '~') label = '没有单据日期（还没识别或没认出）';
+        else if (gk.length === 10) { const d = new Date(gk + 'T00:00:00'); label = `${gk}  周${WEEK[d.getDay()]}`; }
+        else label = `${gk}（只认出月份）`;
+        gh.createSpan({ cls: 'ata-agroup-date', text: label });
+        gh.createSpan({ cls: 'ata-tab-count', text: String(groupCount[gk]) });
+        if (this.archSelect) {
+          const keyNow = gk;
+          const b = gh.createEl('button', { cls: 'ata-agroup-sel', text: '选中这一组' });
+          b.addEventListener('click', () => { list.filter((x) => groupKey(x) === keyNow).forEach((x) => this.archSel.add(x.path)); this.render(); });
+        }
+      }
       const m = meta[f.path] || {};
       const c = grid.createDiv('ata-acard' + (this.archSel.has(f.path) ? ' is-selected' : ''));
-      c.dataset.q = (f.name + ' ' + (m.note || '')).toLowerCase();
+      c.dataset.g = String(gi);
+      c.dataset.q = (f.name + ' ' + (m.note || '') + ' ' + (m.scan ? [m.scan.date, m.scan.type, m.scan.party, m.scan.no, m.scan.summary].join(' ') : '')).toLowerCase();
       const th = c.createDiv('ata-athumb');
       this.renderThumb(th, f);
       th.addEventListener('click', () => { if (!this.archSelect) new LightboxModal(this.app, this, f).open(); });
       const info = c.createDiv('ata-ainfo');
       info.createDiv({ cls: 'ata-aname', text: f.name, attr: { title: f.path } });
       info.createDiv({ cls: 'ata-asub', text: `${fmtSize(f.stat.size)} · ${fmtTime(m.added || f.stat.ctime || f.stat.mtime)}${m.from ? ' · ' + m.from : ''}` });
+      if (m.scan) {
+        const sd = info.createDiv({ cls: 'ata-ascan' + (m.scan.error ? ' is-error' : m.scan.date ? '' : ' is-none') });
+        this.ico(sd, m.scan.error ? 'alert-circle' : 'calendar');
+        sd.createSpan({ text: m.scan.error ? '识别失败' : m.scan.date ? `单据日期 ${m.scan.date}${m.scan.type ? ' · ' + m.scan.type : ''}` : '没认出日期' });
+        sd.setAttribute('title', m.scan.error || [m.scan.party, m.scan.no, m.scan.summary].filter(Boolean).join(' · '));
+      }
       if (m.used && m.used.length) {
         const u = info.createDiv('ata-aused');
         u.createSpan({ text: '已提取到 ' });
@@ -5776,6 +6501,35 @@ class AITableSettingTab extends PluginSettingTab {
         const f = this.app.vault.getAbstractFileByPath(`${view.autoDir()}/使用说明.md`);
         if (f instanceof TFile) { this.app.setting.close(); this.app.workspace.getLeaf('tab').openFile(f); }
       }));
+    containerEl.createEl('h3', { text: '附件 AI 扫描（按时间分类）' });
+    containerEl.createEl('div', { cls: 'setting-item-description', text: '用能看图的 AI 识别附件区图片 / PDF 上的单据日期，自动放进按时间分的文件夹，并记下单据类型、对方名称、单号。API Key 只保存在本机这个库的插件数据里，图片只发给你选的服务商。' });
+    const sc = scanCfg(s);
+    const saveScan = async () => { s.scan = Object.assign({}, sc); await save(); };
+    new Setting(containerEl).setName('服务商').setDesc('选好后自动填 API 地址和模型，也可以自己改。')
+      .addDropdown((d) => { Object.entries(SCAN_PRESETS).forEach(([k, v]) => d.addOption(k, v.label)); d.setValue(sc.provider).onChange(async (v) => { sc.provider = v; const p = SCAN_PRESETS[v]; if (p.url) sc.url = p.url; sc.model = p.model; await saveScan(); this.display(); }); });
+    new Setting(containerEl).setName('API 地址').setDesc((SCAN_PRESETS[sc.provider] || {}).format === 'anthropic' ? 'Anthropic 格式，填到 /v1。' : 'OpenAI 兼容格式，填到 /v1 这一级（不用加 /chat/completions）。')
+      .addText((t) => t.setPlaceholder('https://…/v1').setValue(sc.url).onChange(async (v) => { sc.url = v.trim(); await saveScan(); }));
+    new Setting(containerEl).setName('API Key')
+      .addText((t) => { t.inputEl.type = 'password'; t.setPlaceholder('sk-…').setValue(sc.key).onChange(async (v) => { sc.key = v.trim(); await saveScan(); }); });
+    new Setting(containerEl).setName('模型').setDesc(sc.provider === 'doubao' ? '豆包要填控制台里支持图片的视觉模型 ID 或推理接入点 ID（ep-…）。' : sc.provider === 'deepseek' ? '用 deepseek-flash（V4.1 Flash，能看图）；deepseek-v4-pro 等纯文字模型看不了图片。' : '要用能看图片的模型（视觉 / VL 模型）。')
+      .addText((t) => t.setPlaceholder('模型名').setValue(sc.model).onChange(async (v) => { sc.model = v.trim(); await saveScan(); }));
+    new Setting(containerEl).setName('回复长度上限（tokens）').setDesc('每次识别 AI 最多能回复多少 token。带「思考」的模型会先想再答，上限太低会被截断导致识别失败；一般 4000 足够，失败多可以调到 8000。')
+      .addText((t) => { t.inputEl.type = 'number'; t.setPlaceholder('4000').setValue(String(sc.maxTokens)).onChange(async (v) => { const n = parseInt(v, 10); sc.maxTokens = n >= 200 ? Math.min(n, 32000) : 4000; await saveScan(); }); });
+    new Setting(containerEl).setName('测试连接').setDesc('发一句话给 AI，看 API 地址、Key、模型是否填对。')
+      .addButton((b) => b.setButtonText('测试').onClick(async () => {
+        if (!sc.key || !sc.url || !sc.model) { new Notice('先填好 API 地址、API Key 和模型。'); return; }
+        new Notice('正在测试…');
+        try { const r = await callVision(sc, '只回复两个字：可以'); new Notice('连接成功，AI 回复：' + String(r).slice(0, 30)); } catch (e) { new Notice('连接失败：' + (e.message || e), 10000); }
+      }));
+    new Setting(containerEl).setName('分类方式').setDesc('识别出日期后放进哪种文件夹。只整理附件区根目录和日期文件夹里的附件；你自己建的分类文件夹（例如 客户/华盛）里的不会被移走，只记录日期。')
+      .addDropdown((d) => d.addOption('month', '按月：2026-11').addOption('day', '按日：2026-11 / 11-15').setValue(sc.by).onChange(async (v) => { sc.by = v; await saveScan(); }));
+    new Setting(containerEl).setName('新附件自动识别').setDesc('存进附件区的图片 / PDF 自动识别日期并归类（填好 API 后生效）。关掉后在附件区点「AI 按时间整理」手动识别。')
+      .addToggle((t) => t.setValue(sc.auto).onChange(async (v) => { sc.auto = v; await saveScan(); }));
+    new Setting(containerEl).setName('按识别内容自动改名').setDesc('识别后把「微信图片_2026…」这类文件名改成有意义的名字，例如「2026-11-15_送货单_浙江盈亿纺织_0011047」。')
+      .addToggle((t) => t.setValue(sc.rename).onChange(async (v) => { sc.rename = v; await saveScan(); }));
+    new Setting(containerEl).setName('文件名格式').setDesc('可用：{日期} {类型} {对方} {单号} {说明} {原名}。识别不出的字段会自动去掉。')
+      .addText((t) => t.setPlaceholder(SCAN_DEFAULTS.nameTpl).setValue(sc.nameTpl).onChange(async (v) => { sc.nameTpl = v.trim() || SCAN_DEFAULTS.nameTpl; await saveScan(); }));
+    containerEl.createEl('h3', { text: '其他' });
     new Setting(containerEl).setName('导出 Excel 后自动打开').setDesc('导出 .xlsx 后用系统默认程序（Excel / WPS）打开。')
       .addToggle((t) => t.setValue(s.openAfterExport !== false).onChange(async (v) => { s.openAfterExport = v; await save(); }));
   }

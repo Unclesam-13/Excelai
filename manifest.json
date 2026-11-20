@@ -1,7 +1,7 @@
 {
   "id": "ai-table-assistant",
   "name": "表格工作台",
-  "version": "4.0.0",
+  "version": "4.3.0",
   "minAppVersion": "1.4.0",
   "description": "表格工作台：Obsidian 负责存放、展示和记录，外部 AI 负责改表。Excel 导入后转成 AI 能快速读写的 CSV 底层数据，数据一改自动按原格式生成新的原生 Excel（覆盖上一版）；文件管理、附件分类与批量复制、操作日志与撤销、给 AI 的操作守则。",
   "author": "Unclesam-13",

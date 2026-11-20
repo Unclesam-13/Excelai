@@ -2,33 +2,23 @@
 /* AI 表格助手 · 表格工作台 —— Obsidian 插件（无需构建，直接使用本文件） */
 const {
   Plugin, ItemView, Notice, Modal, FuzzySuggestModal, PluginSettingTab,
-  Setting, requestUrl, setIcon, normalizePath, Platform, TFile, MarkdownRenderer,
+  Setting, setIcon, normalizePath, TFile,
 } = require('obsidian');
 
 const VIEW_TYPE = 'ai-table-assistant-view';
 const MAX_FILE = 200 * 1024 * 1024; // 导入 / 附件大小上限 200MB
-const MAX_PDF = 30 * 1024 * 1024;   // PDF 发给 AI 的上限
 
-const PROVIDER_DEFAULTS = {
-  anthropic: { baseUrl: 'https://api.anthropic.com', model: 'claude-sonnet-5-5', label: 'Claude (Anthropic)' },
-  deepseek: { baseUrl: 'https://api.deepseek.com', model: 'deepseek-flash', visionModel: 'deepseek-flash', label: 'DeepSeek（深度求索）' },
-  openai: { baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o', label: 'OpenAI 兼容（通义、Kimi、豆包等）' },
-};
-const providerOf = (settings) => (PROVIDER_DEFAULTS[settings.provider] ? settings.provider : 'anthropic');
+/* 表格文件夹里由插件生成、给 AI 看的说明文件（不是表格） */
+const GUIDE_FILES = ['AI使用说明.md', '表格目录.md', 'CLAUDE.md', 'AGENTS.md'];
+/* 旧版本内置 AI 用的设置，已经不用了 */
+const OBSOLETE_SETTINGS = ['provider', 'apiKey', 'baseUrl', 'model', 'maxRows', 'preview', 'autoArchive'];
 
 const DEFAULT_SETTINGS = {
-  provider: 'anthropic',
-  apiKey: '',
-  baseUrl: '',
-  model: '',
   folder: 'AI表格助手',
-  maxRows: 300,
   lastTable: '',
   master: '',
   pinned: [],
   recent: [],
-  preview: true,
-  autoArchive: true,
   archiveMeta: {},
   openAfterExport: true,
   meta: {},
@@ -1125,319 +1115,17 @@ function addColumn(t, name, values, def) {
 
 const keyNorm = (v) => cellStr(v).trim().replace(/\s+/g, '').toLowerCase();
 
-function newTrack() { return { cells: new Map(), added: new Set(), structural: false }; }
-function markCell(track, r, c) {
-  if (!track) return;
-  if (!track.cells.has(r)) track.cells.set(r, new Set());
-  track.cells.get(r).add(c);
-}
 
-/** 按关键列合并：匹配到就更新非空字段，匹配不到就新增 */
-function upsertRows(t, keys, objs, track) {
-  const str = (v) => (v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v));
-  const keyCols = (keys || []).map((k) => findCol(t, k)).filter((c) => c >= 0);
-  const index = new Map();
-  if (keyCols.length) {
-    t.rows.forEach((r, i) => {
-      const k = keyCols.map((c) => keyNorm(r[c])).join('\u0001');
-      if (k.replace(/\u0001/g, '') && !index.has(k)) index.set(k, i);
-    });
-  }
-  let upd = 0, cells = 0, add = 0;
-  for (const obj of objs || []) {
-    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) continue;
-    const entries = [];
-    for (const k of Object.keys(obj)) {
-      let c = findCol(t, k);
-      if (c < 0) { if (!String(k).trim()) continue; c = addColumn(t, k); }
-      entries.push([c, str(obj[k]).trim()]);
-    }
-    if (!entries.some(([, v]) => v.trim() !== '')) continue;
-    let hit;
-    let keyVal = '';
-    if (keyCols.length) {
-      keyVal = keyCols.map((c) => { const e = entries.find(([cc]) => cc === c); return keyNorm(e ? e[1] : ''); }).join('\u0001');
-      if (keyVal.replace(/\u0001/g, '')) hit = index.get(keyVal);
-    }
-    if (hit !== undefined) {
-      let changed = 0;
-      for (const [c, v] of entries) {
-        if (v === '' || keyCols.includes(c)) continue;
-        while (t.rows[hit].length < t.headers.length) t.rows[hit].push('');
-        if (t.rows[hit][c] !== v) { t.rows[hit][c] = v; changed++; markCell(track, hit, c); }
-      }
-      if (changed) { upd++; cells += changed; }
-    } else {
-      const line = t.headers.map(() => '');
-      for (const [c, v] of entries) line[c] = v;
-      t.rows.push(line);
-      const idx = t.rows.length - 1;
-      if (keyVal && keyVal.replace(/\u0001/g, '')) index.set(keyVal, idx);
-      if (track) track.added.add(idx);
-      add++;
-    }
-  }
-  return { upd, cells, add };
-}
 
-/** 就地修改表格，返回变更说明数组。ctx: { attachments: {名称: table}, track } */
-function applyActions(t, actions, ctx) {
-  ctx = ctx || {};
-  const track = ctx.track;
-  const log = [];
-  const str = (v) => (v == null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v));
-  const keyList = (k) => (Array.isArray(k) ? k : k ? [k] : []).map(String).filter(Boolean);
-  for (const a of actions || []) {
-    if (!a || typeof a !== 'object') continue;
-    switch (a.type) {
-      case 'add_rows': {
-        let n = 0;
-        for (const r of a.rows || []) {
-          const line = t.headers.map(() => '');
-          if (Array.isArray(r)) {
-            r.forEach((v, i) => {
-              if (i >= t.headers.length) { addColumn(t, '列' + (i + 1)); line.push(''); }
-              line[i] = str(v);
-            });
-          } else if (r && typeof r === 'object') {
-            for (const k of Object.keys(r)) {
-              let c = findCol(t, k);
-              if (c < 0) { c = addColumn(t, k); line.push(''); }
-              line[c] = str(r[k]);
-            }
-          } else continue;
-          while (line.length < t.headers.length) line.push('');
-          t.rows.push(line);
-          if (track) track.added.add(t.rows.length - 1);
-          n++;
-        }
-        if (n) log.push(`新增 ${n} 行`);
-        break;
-      }
-      case 'upsert_rows': {
-        const keys = keyList(a.key || a.keys);
-        const r = upsertRows(t, keys, a.rows, track);
-        if (r.upd || r.add) log.push(`${keys.length ? `按「${keys.join(' + ')}」匹配：` : ''}更新 ${r.upd} 行（${r.cells} 处），新增 ${r.add} 行`);
-        break;
-      }
-      case 'merge_attachment': {
-        const atts = ctx.attachments || {};
-        const names = Object.keys(atts);
-        const name = a.attachment && atts[a.attachment] ? a.attachment
-          : names.find((n) => a.attachment && (n.includes(a.attachment) || String(a.attachment).includes(n))) || (names.length === 1 ? names[0] : null);
-        const src = name && atts[name];
-        if (!src) { log.push(`⚠ 找不到附件表格「${a.attachment || ''}」`); break; }
-        const mapping = a.mapping || {};
-        const pairs = Object.keys(mapping).map((from) => [findCol(src, from), mapping[from]]).filter(([c, to]) => c >= 0 && to);
-        if (!pairs.length) { log.push(`⚠ 附件「${name}」的列对应关系无效`); break; }
-        const set = a.set && typeof a.set === 'object' ? a.set : {};
-        const objs = src.rows.map((r) => {
-          const o = {};
-          for (const [c, to] of pairs) o[to] = r[c] == null ? '' : r[c];
-          return o;
-        }).filter((o) => Object.values(o).some((v) => String(v).trim() !== ''))
-          .map((o) => Object.assign(o, set));
-        const keys = keyList(a.key || a.keys);
-        const r = upsertRows(t, keys, objs, track);
-        log.push(`从「${name}」合并 ${objs.length} 行：更新 ${r.upd} 行（${r.cells} 处），新增 ${r.add} 行`);
-        break;
-      }
-      case 'update_cells': {
-        let n = 0;
-        for (const u of a.updates || []) {
-          const ri = +u.row - 1;
-          const r = t.rows[ri];
-          if (!r) continue;
-          let c = findCol(t, u.column);
-          if (c < 0 && typeof u.column === 'string' && u.column.trim()) c = addColumn(t, u.column);
-          if (c < 0) continue;
-          while (r.length < t.headers.length) r.push('');
-          r[c] = str(u.value);
-          markCell(track, ri, c);
-          n++;
-        }
-        if (n) log.push(`修改 ${n} 个单元格`);
-        break;
-      }
-      case 'add_column': {
-        if (!a.name) break;
-        let c = findCol(t, a.name);
-        const isNew = c < 0;
-        if (isNew) c = addColumn(t, a.name, null, a.default);
-        t.rows.forEach((r, i) => {
-          if (a.values && a.values[i] != null) { r[c] = str(a.values[i]); markCell(track, i, c); }
-          else if (isNew && a.default != null) markCell(track, i, c);
-        });
-        log.push(isNew ? `新增列「${a.name}」` : `更新列「${a.name}」`);
-        break;
-      }
-      case 'rename_column': {
-        const c = findCol(t, a.from);
-        if (c >= 0 && a.to) { t.headers[c] = String(a.to); log.push(`列「${a.from}」改名为「${a.to}」`); }
-        break;
-      }
-      case 'delete_column': {
-        const c = findCol(t, a.name);
-        if (c >= 0) {
-          t.headers.splice(c, 1);
-          t.rows.forEach((r) => r.splice(c, 1));
-          if (t.colSrc) t.colSrc.splice(c, 1);
-          if (track) track.structural = true;
-          log.push(`删除列「${a.name}」`);
-        }
-        break;
-      }
-      case 'delete_rows': {
-        const idx = [...new Set((a.rows || []).map((x) => +x - 1))]
-          .filter((i) => i >= 0 && i < t.rows.length).sort((x, y) => y - x);
-        idx.forEach((i) => t.rows.splice(i, 1));
-        if (idx.length) { if (track) track.structural = true; log.push(`删除 ${idx.length} 行`); }
-        break;
-      }
-      case 'sort': {
-        const c = findCol(t, a.column);
-        if (c < 0) break;
-        const dir = String(a.order || 'asc').toLowerCase().startsWith('d') ? -1 : 1;
-        const num = (v) => /^-?[\d,]*\.?\d+$/.test(String(v).trim()) ? parseFloat(String(v).replace(/,/g, '')) : NaN;
-        t.rows.sort((x, y) => {
-          const nx = num(x[c]), ny = num(y[c]);
-          return dir * (!isNaN(nx) && !isNaN(ny) ? nx - ny : String(x[c]).localeCompare(String(y[c]), 'zh-Hans-CN', { numeric: true }));
-        });
-        if (track) track.structural = true;
-        log.push(`按「${t.headers[c]}」${dir > 0 ? '升序' : '降序'}排序`);
-        break;
-      }
-      case 'replace_table': {
-        if (!Array.isArray(a.headers)) break;
-        const nt = normalizeTable({ headers: a.headers.map(str), rows: (a.rows || []).map((r) => (Array.isArray(r) ? r.map(str) : [])) });
-        t.headers = nt.headers;
-        t.rows = nt.rows;
-        t.colSrc = null;
-        if (track) track.structural = true;
-        log.push(`重建表格（${t.rows.length} 行 × ${t.headers.length} 列）`);
-        break;
-      }
-    }
-  }
-  return log;
-}
 
-function tableToPrompt(t, maxRows) {
-  if (!t.headers.length) return '（空表，还没有任何列）';
-  const shown = t.rows.slice(0, maxRows);
-  const lines = [['#', ...t.headers].map(csvCell).join(',')];
-  shown.forEach((r, i) => lines.push([String(i + 1), ...r].map(csvCell).join(',')));
-  let s = lines.join('\n');
-  if (t.rows.length > shown.length) s += `\n（共 ${t.rows.length} 行，这里只显示前 ${shown.length} 行）`;
-  return s;
-}
 
 /**
  * 宽松修复 AI 返回的 JSON：字符串里的英文双引号、直接换行、多余逗号、被截断没写完的结尾。
  */
-function repairJSON(src) {
-  let out = '';
-  const stack = [];
-  let inStr = false;
-  for (let i = 0; i < src.length; i++) {
-    const ch = src[i];
-    if (inStr) {
-      if (ch === '\\') {
-        const nx = src[i + 1];
-        if (nx === undefined) break;
-        if ('"\\/bfnrtu'.includes(nx)) { out += ch + nx; i++; }
-        else out += '\\\\';
-        continue;
-      }
-      if (ch === '"') {
-        let j = i + 1;
-        while (j < src.length && /\s/.test(src[j])) j++;
-        const nx = src[j];
-        if (nx === undefined || nx === ',' || nx === '}' || nx === ']' || nx === ':') { inStr = false; out += ch; }
-        else out += '\\"'; // 字符串中间的英文引号
-        continue;
-      }
-      if (ch === '\n') { out += '\\n'; continue; }
-      if (ch === '\r') continue;
-      if (ch === '\t') { out += '\\t'; continue; }
-      out += ch;
-      continue;
-    }
-    if (ch === '"') { inStr = true; out += ch; continue; }
-    if (ch === '{' || ch === '[') { stack.push(ch === '{' ? '}' : ']'); out += ch; continue; }
-    if (ch === '}' || ch === ']') {
-      out = out.replace(/,\s*$/, '');
-      if (stack.length && stack[stack.length - 1] === ch) stack.pop();
-      out += ch;
-      if (!stack.length) break; // 最外层结束，后面的说明文字不要
-      continue;
-    }
-    out += ch;
-  }
-  repairJSON.truncated = inStr || stack.length > 0;
-  if (inStr) out += '"';
-  out = out.replace(/,\s*$/, '').replace(/:\s*$/, ': null');
-  while (stack.length) { out = out.replace(/,\s*$/, ''); out += stack.pop(); }
-  return out;
-}
 
-function extractJSON(text) {
-  if (!text) return null;
-  const s = String(text).trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
-  const a = s.indexOf('{');
-  if (a < 0) return null;
-  const b = s.lastIndexOf('}');
-  if (b > a) { try { return JSON.parse(s.slice(a, b + 1)); } catch (e) { /* 试着修复 */ } }
-  try {
-    const r = JSON.parse(repairJSON(s.slice(a)));
-    if (r && typeof r === 'object' && repairJSON.truncated) Object.defineProperty(r, '__truncated', { value: true });
-    return r;
-  } catch (e) { /* 还是不行 */ }
-  return null;
-}
 
-/** 实在解析不了时，至少把 reply 的文字取出来 */
-function salvageReply(text) {
-  const m = /"reply"\s*:\s*"([\s\S]*?)(?:"\s*,\s*"actions"|"\s*}\s*$|$)/.exec(String(text || ''));
-  if (!m) return null;
-  return m[1].replace(/\\n/g, '\n').replace(/\\t/g, '  ').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-}
 
-const SYSTEM_PROMPT = `你是 Obsidian 里的「AI 表格助手」，服务对象是做会计 / 采购 / 对账工作的用户。每次用户发言时，你会看到当前「目标表格」（CSV 形式，第一列 # 是行号，不属于表格数据），以及用户可能附带的图片、PDF（单据、价格表、对账单、截图）或其它表格文件。你的工作是按用户要求修改目标表格，或回答关于表格的问题。
 
-【输出格式】只输出一个 JSON 对象，不要输出任何其它文字，不要使用代码块：
-{"reply":"给用户的简短中文说明","actions":[ ... ]}
-
-【可用的 action】
-- {"type":"upsert_rows","key":["关键列", ...],"rows":[{"列名":"值", ...}]}
-  按关键列合并：关键列的值和已有行相同就更新该行（只更新你给出的非空字段），否则新增一行。插件会在【整张表】里匹配，即使你只看到了部分行。录入单据、更新价格表时优先用它。
-- {"type":"merge_attachment","attachment":"附件文件名","mapping":{"附件列名":"目标表列名", ...},"key":["目标表关键列", ...],"set":{"目标表列名":"固定值"}}
-  把附件表格的【全部行】按 mapping 换成目标表的列，再按 key 合并（规则同 upsert_rows）。附件是表格且行数较多时必须用它，不要把附件内容逐行抄进 upsert_rows。set 用来给所有行统一填值，例如来源、更新日期。不需要匹配时 key 用空数组（全部新增）。
-- {"type":"add_rows","rows":[{"列名":"值", ...}]}  在末尾追加行（确定都是新记录时用）
-- {"type":"update_cells","updates":[{"row":行号,"column":"列名","value":"值"}]}
-- {"type":"add_column","name":"列名","values":["第1行的值","第2行的值", ...]}  新增一列（列已存在则覆盖），values 按行号顺序
-- {"type":"rename_column","from":"旧列名","to":"新列名"}
-- {"type":"delete_column","name":"列名"}
-- {"type":"delete_rows","rows":[行号, ...]}  放在 actions 最后
-- {"type":"sort","column":"列名","order":"asc 或 desc"}
-- {"type":"replace_table","headers":["列1", ...],"rows":[["值", ...], ...]}  整表重建，仅在需要大幅重组或目标表为空需要建表时使用
-
-【规则】
-1. 行号从 1 开始，不含表头。所有值都用字符串。日期统一写成 YYYY-MM-DD，金额、单价、数量只写数字（不带单位和千分位逗号）。
-2. 关键列要选能唯一识别一条记录的列，例如：品名+规格、物料编码、单号、发票号码。目标表里没有合适关键列时，用 add_rows。
-3. 如果目标表里有「来源」「来源单据」「更新日期」「录入日期」之类的列，填上附件名称和单据日期（单据上没有日期就用今天）。
-4. 图片 / PDF：仔细识别其中的文字、表格、票据，按目标表的列含义对应填入；一张单据有多条明细就输出多行。看不到的信息留空，绝不编造；看不清或不确定的值在 reply 里点名提醒用户核对。
-5. 分类任务：用 add_column 新增一列（默认叫「分类」），为每一行给出类别。
-6. 如果用户只是提问或要求检查，actions 用空数组，在 reply 里回答。
-7. 表格被截断显示时，按行号的修改（update_cells / delete_rows / add_column）只能针对你看到的行，并在 reply 里说明。
-8. reply 简短，说明做了什么、哪些需要人工核对。`;
-
-const ROUTE_PROMPT = `你是表格归档助手。用户手上有很多张要填写的表格，现在收到了一些新资料（单据、送货单、价格表、对账单、订单截图、PDF 或表格文件），需要判断这些资料应该填进哪张表。你会看到候选表格列表（编号、名称、所属文件、列名、一行样例）和新资料的内容。
-
-只输出一个 JSON 对象，不要输出其它文字：
-{"reply":"一句话说明资料是什么","candidates":[{"id":编号,"score":0到100,"reason":"12字以内的理由"}],"new_table":null 或 {"name":"建议表名","headers":["列1","列2", ...]}}
-
-规则：candidates 最多 5 个，按匹配程度从高到低；资料中的字段与表格列越吻合、业务越相关（同一客户、同类单据）分数越高。如果没有一张表合适（最高低于 40 分），给出 new_table 建议，列名用资料里的字段；否则 new_table 为 null。`;
 
 const hKey = (h) => cellStr(h).replace(/[\s（）()【】\[\]：:、\/\-_*#.。，,]/g, '').toLowerCase();
 /** 两组列名的相似度 0~1（Dice 系数，允许包含关系） */
@@ -1450,136 +1138,130 @@ function headerScore(a, b) {
   return (2 * hit) / (A.length + B.length);
 }
 
-const MASTER_PROMPT = '请把附件里的信息整理进当前表格：按关键列（如品名+规格、编码或单号）匹配已有记录，有变化的字段更新，没有的记录新增；如果表格里有「来源」「更新日期」之类的列，填上附件名和单据日期。附件是表格时用 merge_attachment。最后说明改了什么、哪些需要我核对。';
 
 /* ====================================================================
  * 二、AI 接口
  * ==================================================================== */
-async function callAI(settings, history, userText, files, system) {
-  system = system || SYSTEM_PROMPT;
-  files = files || [];
-  const provider = providerOf(settings);
-  const def = PROVIDER_DEFAULTS[provider];
-  const base = (settings.baseUrl || def.baseUrl).trim().replace(/\/+$/, '');
-  let model = (settings.model || def.model).trim();
-  if (!settings.apiKey) throw new Error('还没有填写 API Key，请到 设置 → AI 表格助手 中填写。');
-  /* DeepSeek / OpenAI 兼容接口不能直接读 PDF：把 PDF 前几页转成图片 */
-  if (provider !== 'anthropic' && files.some((f) => f.kind === 'pdf')) {
-    const out = [];
-    for (const f of files) {
-      if (f.kind !== 'pdf') { out.push(f); continue; }
-      const pages = await pdfToImages(f);
-      if (!pages.length) throw new Error(`当前 AI 服务不能直接读 PDF，而且「${f.name}」转图片失败。请截图后作为图片发送，或改用 Claude。`);
-      out.push(...pages);
-    }
-    files = out;
-  }
-  /* DeepSeek 只有 Flash 能看图片：带图片时自动换成能看图的模型 */
-  if (provider === 'deepseek' && files.length && !/flash/i.test(model)) model = def.visionModel;
-
-  let url, headers, body;
-  if (provider === 'anthropic') {
-    url = base + '/v1/messages';
-    headers = { 'content-type': 'application/json', 'x-api-key': settings.apiKey, 'anthropic-version': '2023-06-01' };
-    const content = files.map((f) => f.kind === 'pdf'
-      ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: f.data }, title: f.name }
-      : { type: 'image', source: { type: 'base64', media_type: f.mediaType, data: f.data } });
-    content.push({ type: 'text', text: userText });
-    body = { model, max_tokens: 16000, system, messages: [...history, { role: 'user', content }] };
-  } else {
-    url = base + '/chat/completions';
-    headers = { 'content-type': 'application/json', authorization: 'Bearer ' + settings.apiKey };
-    const content = files.length
-      ? [{ type: 'text', text: userText }, ...files.map((im) => ({ type: 'image_url', image_url: { url: `data:${im.mediaType};base64,${im.data}` } }))]
-      : userText;
-    body = { model, messages: [{ role: 'system', content: system }, ...history, { role: 'user', content }] };
-    if (provider === 'deepseek') {
-      body.response_format = { type: 'json_object' }; // 提示词里要求输出 JSON，DeepSeek 支持 JSON 模式
-      body.max_tokens = 16000;
-    }
-  }
-
-  const res = await requestUrl({ url, method: 'POST', headers, body: JSON.stringify(body), throw: false });
-  let json = null;
-  try { json = JSON.parse(res.text); } catch (e) { /* 非 JSON */ }
-  if (res.status < 200 || res.status >= 300) {
-    const msg = (json && json.error && (json.error.message || json.error)) || (res.text || '').slice(0, 300);
-    throw new Error(`AI 接口返回错误（${res.status}）：${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);
-  }
-  if (!json) throw new Error('AI 接口返回的内容无法解析。');
-  if (provider === 'anthropic') return (json.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('');
-  if (json.choices && json.choices[0] && json.choices[0].finish_reason === 'length') console.warn('[AI表格助手] 回复被截断');
-  const c = json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content;
-  return Array.isArray(c) ? c.map((x) => x.text || '').join('') : c || '';
-}
 
 /* ---------- 附件读取 ---------- */
-function readAsDataURL(file) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = () => res(r.result);
-    r.onerror = () => rej(new Error('读取文件失败'));
-    r.readAsDataURL(file);
-  });
-}
 
-/** 图片 → base64（过大时缩小并转 JPEG） */
-async function imageToPayload(file) {
-  let dataUrl = await readAsDataURL(file);
-  let mediaType = file.type || 'image/png';
-  const supported = /^image\/(jpeg|png|webp|gif)$/.test(mediaType);
-  try {
-    const img = await new Promise((res, rej) => {
-      const i = new Image();
-      i.onload = () => res(i);
-      i.onerror = rej;
-      i.src = dataUrl;
-    });
-    const scale = Math.min(1, 2000 / Math.max(img.width, img.height));
-    if (scale < 1 || file.size > 3e6 || !supported) {
-      const cv = document.createElement('canvas');
-      cv.width = Math.max(1, Math.round(img.width * scale));
-      cv.height = Math.max(1, Math.round(img.height * scale));
-      const ctx = cv.getContext('2d');
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(0, 0, cv.width, cv.height);
-      ctx.drawImage(img, 0, 0, cv.width, cv.height);
-      dataUrl = cv.toDataURL('image/jpeg', 0.9);
-      mediaType = 'image/jpeg';
-    }
-  } catch (e) {
-    if (!supported) throw new Error(`无法读取图片「${file.name}」，请换成 JPG / PNG 格式。`);
-  }
-  return { kind: 'image', name: file.name || '图片', mediaType, data: dataUrl.slice(dataUrl.indexOf(',') + 1), dataUrl };
-}
 
-/** 用 Obsidian 自带的 PDF.js 把 PDF 前几页渲染成图片（给不能直接读 PDF 的 AI 用） */
-async function pdfToImages(pdf, maxPages) {
-  maxPages = maxPages || 6;
-  let lib = null;
-  try { lib = await nodeObsidian().loadPdfJs(); } catch (e) { lib = window.pdfjsLib || null; }
-  if (!lib) return [];
-  const bytes = Uint8Array.from(atob(pdf.data), (c) => c.charCodeAt(0));
-  const doc = await lib.getDocument({ data: bytes }).promise;
-  const out = [];
-  for (let i = 1; i <= Math.min(doc.numPages, maxPages); i++) {
-    const page = await doc.getPage(i);
-    const vp0 = page.getViewport({ scale: 1 });
-    const scale = Math.min(2.5, 1800 / Math.max(vp0.width, vp0.height));
-    const vp = page.getViewport({ scale });
-    const cv = document.createElement('canvas');
-    cv.width = Math.round(vp.width);
-    cv.height = Math.round(vp.height);
-    const ctx = cv.getContext('2d');
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, cv.width, cv.height);
-    await page.render({ canvasContext: ctx, viewport: vp }).promise;
-    const url = cv.toDataURL('image/jpeg', 0.88);
-    out.push({ kind: 'image', name: `${pdf.name} 第${i}页`, mediaType: 'image/jpeg', data: url.slice(url.indexOf(',') + 1) });
-  }
-  return out;
-}
 const nodeObsidian = () => require('obsidian');
+
+/* ====================================================================
+ * 外部修改对比：找出两版表格之间新增 / 删除 / 修改了什么
+ * ==================================================================== */
+function hashStr(s) {
+  let h1 = 0x811c9dc5, h2 = 5381;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619);
+    h2 = (Math.imul(h2, 33) + c) | 0;
+  }
+  return (h1 >>> 0).toString(36) + (h2 >>> 0).toString(36) + s.length.toString(36);
+}
+
+function diffTables(a, b) {
+  const used = new Set();
+  const colMap = b.headers.map((h) => {
+    const i = a.headers.findIndex((x, k) => !used.has(k) && String(x) === String(h));
+    if (i >= 0) used.add(i);
+    return i;
+  });
+  const renamed = [];
+  b.headers.forEach((h, j) => {
+    if (colMap[j] < 0 && j < a.headers.length && !used.has(j)) { colMap[j] = j; used.add(j); renamed.push([String(a.headers[j]), String(h)]); }
+  });
+  const addedCols = b.headers.map((h, j) => (colMap[j] < 0 ? j : -1)).filter((j) => j >= 0);
+  const removedCols = a.headers.map((h, i) => (used.has(i) ? null : String(h))).filter((x) => x != null);
+  const common = colMap.map((i, j) => [i, j]).filter(([i]) => i >= 0);
+  const keyA = a.rows.map((r) => common.map(([i]) => cellStr(r[i])).join('\u0001'));
+  const keyB = b.rows.map((r) => common.map(([, j]) => cellStr(r[j])).join('\u0001'));
+  const n = keyA.length, m = keyB.length;
+  const rowMap = new Array(m).fill(-1);
+  let p = 0;
+  while (p < n && p < m && keyA[p] === keyB[p]) { rowMap[p] = p; p++; }
+  let s = 0;
+  while (s < n - p && s < m - p && keyA[n - 1 - s] === keyB[m - 1 - s]) { rowMap[m - 1 - s] = n - 1 - s; s++; }
+  const A0 = p, A1 = n - s, B0 = p, B1 = m - s, na = A1 - A0, nb = B1 - B0;
+  const pairs = [];
+  if (na && nb) {
+    if (na * nb <= 4e6 && na < 65535 && nb < 65535) {
+      const W = nb + 1, dp = new Uint16Array((na + 1) * W);
+      for (let i = na - 1; i >= 0; i--) {
+        for (let j = nb - 1; j >= 0; j--) {
+          dp[i * W + j] = keyA[A0 + i] === keyB[B0 + j] ? dp[(i + 1) * W + j + 1] + 1 : Math.max(dp[(i + 1) * W + j], dp[i * W + j + 1]);
+        }
+      }
+      let i = 0, j = 0;
+      while (i < na && j < nb) {
+        if (keyA[A0 + i] === keyB[B0 + j]) { pairs.push([A0 + i, B0 + j]); i++; j++; }
+        else if (dp[(i + 1) * W + j] >= dp[i * W + j + 1]) i++;
+        else j++;
+      }
+    } else {
+      const pos = new Map();
+      for (let i = A0; i < A1; i++) { const k = keyA[i]; if (!pos.has(k)) pos.set(k, []); pos.get(k).push(i); }
+      let last = A0 - 1;
+      for (let j = B0; j < B1; j++) {
+        const q = pos.get(keyB[j]);
+        if (!q) continue;
+        while (q.length && q[0] <= last) q.shift();
+        if (q.length) { last = q.shift(); pairs.push([last, j]); }
+      }
+    }
+  }
+  pairs.forEach(([i, j]) => { rowMap[j] = i; });
+  const cells = [], added = [], removed = [];
+  const cmpRow = (i, j) => {
+    for (const [ci, cj] of common) {
+      const o = cellStr(a.rows[i][ci]), v = cellStr(b.rows[j][cj]);
+      if (o !== v) cells.push({ r: j, c: cj, o, n: v });
+    }
+  };
+  const sim = (i, j) => {
+    let eq = 0, tot = 0;
+    for (const [ci, cj] of common) {
+      const o = cellStr(a.rows[i][ci]), v = cellStr(b.rows[j][cj]);
+      if (o || v) { tot++; if (o === v) eq++; }
+    }
+    return tot ? eq / tot : 0;
+  };
+  const anchors = [[A0 - 1, B0 - 1], ...pairs, [A1, B1]];
+  for (let k = 0; k + 1 < anchors.length; k++) {
+    const ga = [], gb = [];
+    for (let i = anchors[k][0] + 1; i < anchors[k + 1][0]; i++) ga.push(i);
+    for (let j = anchors[k][1] + 1; j < anchors[k + 1][1]; j++) gb.push(j);
+    if (!ga.length) { added.push(...gb); continue; }
+    if (!gb.length) { removed.push(...ga); continue; }
+    const taken = new Set();
+    if (ga.length * gb.length <= 40000) {
+      for (const i of ga) {
+        let best = -1, bs = 0.34;
+        for (const j of gb) { if (taken.has(j)) continue; const sc = sim(i, j); if (sc > bs) { bs = sc; best = j; } }
+        if (best >= 0) { taken.add(best); rowMap[best] = i; cmpRow(i, best); } else removed.push(i);
+      }
+    } else {
+      const c = Math.min(ga.length, gb.length);
+      for (let x = 0; x < c; x++) { taken.add(gb[x]); rowMap[gb[x]] = ga[x]; cmpRow(ga[x], gb[x]); }
+      removed.push(...ga.slice(c));
+    }
+    gb.forEach((j) => { if (!taken.has(j)) added.push(j); });
+  }
+  cells.sort((x, y) => x.r - y.r || x.c - y.c);
+  added.sort((x, y) => x - y);
+  removed.sort((x, y) => x - y);
+  const filled = addedCols.map((j) => b.rows.filter((r) => !isBlank(r[j])).length);
+  return { colMap, renamed, addedCols, removedCols, rowMap, cells, added, removed, filled };
+}
+
+/* 交给外部 AI 时的常用要求 */
+const AI_TEMPLATES = [
+  ['录入单据', '把附件里的单据内容录入这张表：按表格现有的列整理，每条记录一行，加在表格末尾；已经有的记录（同一单号，或同一品名 + 规格 + 日期）就更新那一行，不要重复添加。'],
+  ['按价格表更新', '用附件里的价格表更新这张表的价格：按品名 + 规格匹配，只改价格相关的列，不要新增或删除行；表里找不到的品名请在回复里列出来。'],
+  ['核对数据', '检查这张表有没有重复行、空缺、算错（例如 数量 × 单价 ≠ 金额）或格式不统一的地方。先在回复里列出来，不要修改文件。'],
+  ['整理分类', '根据每一行的内容判断类别，在表格最后新增一列「分类」并填好。不要改动其它列，也不要调整行的顺序。'],
+];
 
 const ARCHIVE_KINDS = [['全部', null], ['图片', 'image'], ['PDF', 'pdf'], ['表格', 'table'], ['文档', 'doc'], ['其他', 'other']];
 function archiveKind(f) {
@@ -1641,11 +1323,6 @@ async function renderPdfPages(app, tf, width, maxPages) {
   return { urls, total };
 }
 
-async function pdfToPayload(file) {
-  if (file.size > MAX_PDF) throw new Error(`PDF「${file.name}」超过 30MB，AI 读不了这么大的 PDF，请拆分或截图后发送。`);
-  const dataUrl = await readAsDataURL(file);
-  return { kind: 'pdf', name: file.name, data: dataUrl.slice(dataUrl.indexOf(',') + 1) };
-}
 
 /** 读取表格文件 → { table, title } */
 async function fileToTable(file, onProgress) {
@@ -1677,8 +1354,6 @@ async function fileToSheets(file, onProgress) {
   return [{ name: '', index: 0, table: r.table, title: r.title }];
 }
 
-const isImageFile = (f) => /^image\//.test(f.type) || /\.(png|jpe?g|webp|gif|heic|bmp)$/i.test(f.name || '');
-const isPdfFile = (f) => f.type === 'application/pdf' || /\.pdf$/i.test(f.name || '');
 const baseName = (name) => name.replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|#^[\]]/g, '_').trim() || '表格';
 const TABLE_EXT = /\.(csv|tsv|xlsx|xlsm|md|markdown)$/i;
 const safeSeg = (s) => String(s).replace(/[\\/:*?"<>|#^[\]]/g, '_').replace(/^\.+/, '').trim();
@@ -1788,21 +1463,17 @@ function clipboardFilePaths() {
   return [];
 }
 
-const CLASSIFY_PROMPT = `你是表格文件归类助手。用户会给你若干个表格文件的路径、列名和前几行样例。请根据内容（不要只看文件名）为每个文件归入一个简洁的类别（2~6 个字，例如：收入、费用报销、银行流水、发票、工资、固定资产、往来款、预算）。用户指定了类别体系时只能使用用户给的类别。类别之间要互斥，数量尽量少。
-
-只输出一个 JSON 对象，不要输出其它文字：
-{"reply":"一句话说明归类结果","categories":[{"path":"文件路径（原样返回）","category":"类别"}]}`;
 
 /* ====================================================================
  * 三、弹窗
  * ==================================================================== */
 class TablePickModal extends FuzzySuggestModal {
-  constructor(app, files, onPick, meta) {
+  constructor(app, files, onPick, meta, placeholder) {
     super(app);
     this.files = files;
     this.onPick = onPick;
     this.meta = meta || {};
-    this.setPlaceholder('选择表格（.csv 文件，或含表格的 .md 笔记）');
+    this.setPlaceholder(placeholder || '选择表格（.csv 文件，或含表格的 .md 笔记）');
   }
   getItems() {
     if (this.files) return this.files;
@@ -1890,155 +1561,6 @@ class CategoryModal extends Modal {
   onClose() { this.contentEl.empty(); }
 }
 
-class RouteModal extends Modal {
-  /** 收到新资料：推荐应该填进哪张表 */
-  constructor(app, view, list) {
-    super(app);
-    this.view = view;
-    this.list = list;
-    this.scores = new Map(); // path -> { local, ai, reason }
-    this.query = '';
-  }
-  async onOpen() {
-    const v = this.view, list = this.list;
-    this.modalEl.addClass('ata-route-modal');
-    this.tables = list.filter((x) => TABLE_EXT.test(x.file.name));
-    this.docs = list.filter((x) => isImageFile(x.file) || isPdfFile(x.file));
-    const other = list.length - this.tables.length - this.docs.length;
-    this.titleEl.setText('要填到哪张表？');
-    const info = this.contentEl.createDiv('ata-route-info');
-    info.createDiv({ text: `收到 ${list.length} 个文件：${list.slice(0, 3).map((x) => x.file.name).join('、')}${list.length > 3 ? ' 等' : ''}` });
-    if (other) info.createDiv({ cls: 'ata-muted', text: `${other} 个不是表格 / 图片 / PDF，会跳过。` });
-
-    const search = this.contentEl.createEl('input', { cls: 'ata-route-search', attr: { type: 'text', placeholder: '搜索表格名称、列名…' } });
-    search.addEventListener('input', () => { this.query = search.value.trim().toLowerCase(); this.draw(); });
-    this.statusEl = this.contentEl.createDiv('ata-route-status');
-    this.listEl = this.contentEl.createDiv('ata-route-list');
-    this.extraEl = this.contentEl.createDiv('ata-route-extra');
-
-    const bar = this.contentEl.createDiv('ata-route-bar');
-    if (this.tables.length) {
-      const b = bar.createEl('button', { text: `不填现有表，导入为新表格（${this.tables.length} 个文件）` });
-      b.addEventListener('click', () => { this.close(); v.importBatch(list); });
-    }
-    const nb = bar.createEl('button', { text: '新建一张空表再填' });
-    nb.addEventListener('click', () => {
-      this.close();
-      new NewTableModal(this.app, async (n, c, f) => { const file = await v.createTable(n, c, f, true); if (file) await v.fillTable(file, list); }).open();
-    });
-
-    this.lib = v.lib && v.lib.length ? v.lib : await v.library();
-    /* 表格文件：先在本地按列名比对 */
-    this.incoming = [];
-    for (const x of this.tables) {
-      try {
-        for (const sh of await fileToSheets(x.file)) this.incoming.push({ name: x.file.name + (sh.name ? '·' + sh.name : ''), headers: sh.table.headers, sample: sh.table.rows[0] || [] });
-      } catch (e) { /* 读不了就不比 */ }
-    }
-    for (const t of this.lib) {
-      let best = 0;
-      for (const inc of this.incoming) best = Math.max(best, headerScore(inc.headers, t.headers));
-      if (best) this.scores.set(t.file.path, { local: best });
-    }
-    this.draw();
-    search.focus();
-
-    const top = Math.max(0, ...[...this.scores.values()].map((s) => s.local || 0));
-    if (this.lib.length > 1 && v.settings.apiKey && (this.docs.length || top < 0.6)) this.askAI();
-    else if (!v.settings.apiKey && this.docs.length) this.statusEl.setText('填写 API Key 后，AI 可以看图片 / PDF 帮你判断该填哪张表。');
-  }
-
-  rank() {
-    const recent = this.view.settings.recent || [];
-    const pinned = this.view.settings.pinned || [];
-    const cur = this.view.file && this.view.file.path;
-    return this.lib.map((t) => {
-      const s = this.scores.get(t.file.path) || {};
-      const score = s.ai != null ? s.ai / 100 * 0.7 + (s.local || 0) * 0.3 : (s.local || 0);
-      const ri = recent.indexOf(t.file.path);
-      const bonus = (pinned.includes(t.file.path) ? 0.003 : 0) + (ri >= 0 ? 0.004 - ri * 0.0001 : 0) + (t.file.path === cur ? 0.001 : 0);
-      return { t, s, score, sort: score + bonus };
-    }).filter((x) => {
-      if (!this.query) return true;
-      const m = (this.view.settings.meta || {})[x.t.file.path] || {};
-      return [x.t.file.path, m.sheet, m.workbook, ...x.t.headers].join(' ').toLowerCase().includes(this.query);
-    }).sort((a, b) => b.sort - a.sort);
-  }
-
-  draw() {
-    const v = this.view;
-    this.listEl.empty();
-    const rows = this.rank().slice(0, 40);
-    if (!rows.length) this.listEl.createDiv({ cls: 'ata-muted', text: '没有匹配的表格。' });
-    const meta = v.settings.meta || {};
-    rows.forEach(({ t, s, score }, i) => {
-      const r = this.listEl.createDiv('ata-route-row' + (i === 0 && score >= 0.4 ? ' is-best' : ''));
-      const left = r.createDiv('ata-route-main');
-      const name = left.createDiv('ata-route-name');
-      if ((v.settings.pinned || []).includes(t.file.path)) name.createSpan({ cls: 'ata-star', text: '★' });
-      const m = meta[t.file.path] || {};
-      name.createSpan({ text: m.sheet ? `${m.sheet}` : t.file.basename });
-      if (m.workbook) name.createSpan({ cls: 'ata-route-book', text: m.workbook });
-      if (v.file && v.file.path === t.file.path) name.createSpan({ cls: 'ata-route-book', text: '当前' });
-      left.createDiv({ cls: 'ata-route-sub', text: `${t.rows} 行 · ${t.headers.slice(0, 8).join('、')}` });
-      if (s.reason) left.createDiv({ cls: 'ata-route-reason', text: '🤖 ' + s.reason });
-      const pct = Math.round(score * 100);
-      const badge = r.createDiv({ cls: 'ata-route-score' + (pct >= 60 ? ' is-high' : pct >= 35 ? ' is-mid' : ''), text: pct ? `${pct}%` : '' });
-      if (!pct) badge.addClass('is-none');
-      r.addEventListener('click', () => { this.close(); v.fillTable(t.file, this.list); });
-    });
-  }
-
-  async askAI() {
-    const v = this.view;
-    this.statusEl.empty();
-    this.statusEl.addClass('is-loading');
-    this.statusEl.setText('🤖 AI 正在看资料，判断该填哪张表…（可以直接点选，不用等）');
-    try {
-      const files = [];
-      for (const x of this.docs.slice(0, 4)) {
-        files.push(isPdfFile(x.file) ? await pdfToPayload(x.file) : await imageToPayload(x.file));
-      }
-      const pool = this.rank().slice(0, 80).map((x) => x.t);
-      const meta = v.settings.meta || {};
-      let prompt = '【候选表格】\n';
-      pool.forEach((t, i) => {
-        const m = meta[t.file.path] || {};
-        const sample = (t.sample && t.sample[0] ? t.sample[0] : []).slice(0, 10).map((c) => String(c).slice(0, 16)).join(' | ');
-        prompt += `${i + 1}. ${m.sheet || t.file.basename}${m.workbook ? `（文件：${m.workbook}）` : ''}${m.title ? `（标题：${m.title.slice(0, 40)}）` : ''}\n   列：${t.headers.slice(0, 25).join('、')}\n   样例：${sample}\n`;
-      });
-      prompt += '\n【新资料】\n';
-      this.incoming.slice(0, 6).forEach((inc) => { prompt += `表格「${inc.name}」列：${inc.headers.slice(0, 25).join('、')}；样例：${inc.sample.slice(0, 10).join(' | ')}\n`; });
-      files.forEach((f) => { prompt += `${f.kind === 'pdf' ? 'PDF' : '图片'}「${f.name}」（见上方）\n`; });
-      const raw = await callAI(v.settings, [], prompt, files, ROUTE_PROMPT);
-      const res = extractJSON(raw);
-      if (!res || !Array.isArray(res.candidates)) throw new Error('AI 返回格式不对');
-      for (const c of res.candidates) {
-        const t = pool[+c.id - 1];
-        if (!t) continue;
-        const s = this.scores.get(t.file.path) || {};
-        this.scores.set(t.file.path, Object.assign(s, { ai: Math.max(0, Math.min(100, +c.score || 0)), reason: c.reason || '' }));
-      }
-      this.statusEl.removeClass('is-loading');
-      this.statusEl.setText('🤖 ' + (res.reply || 'AI 已给出推荐'));
-      this.extraEl.empty();
-      if (res.new_table && res.new_table.name && Array.isArray(res.new_table.headers)) {
-        const nt = res.new_table;
-        const b = this.extraEl.createEl('button', { cls: 'mod-cta', text: `没有合适的表？按 AI 建议新建「${nt.name}」（${nt.headers.slice(0, 6).join('、')}${nt.headers.length > 6 ? '…' : ''}）` });
-        b.addEventListener('click', async () => {
-          this.close();
-          const file = await v.createTable(nt.name, nt.headers.map(String), 'csv', true);
-          if (file) await v.fillTable(file, this.list);
-        });
-      }
-      this.draw();
-    } catch (e) {
-      this.statusEl.removeClass('is-loading');
-      this.statusEl.setText('AI 判断失败：' + (e.message || e) + '（可以直接手动点选）');
-    }
-  }
-  onClose() { this.contentEl.empty(); }
-}
 
 /** 附件区：大图 / PDF 预览 */
 class LightboxModal extends Modal {
@@ -2049,8 +1571,9 @@ class LightboxModal extends Modal {
     this.titleEl.setText(tf.name);
     const bar = this.contentEl.createDiv('ata-lb-bar');
     const btn = (text, fn, cta) => { const b = bar.createEl('button', { text, cls: cta ? 'mod-cta' : '' }); b.addEventListener('click', fn); };
-    btn('送去提取', () => { this.close(); v.archiveExtract([tf], 'route'); }, true);
-    if (v.file) btn(`加到「${(v.settings.meta[v.file.path] || {}).sheet || v.file.basename}」`, () => { this.close(); v.archiveExtract([tf], 'current'); });
+    btn('交给 AI 填表', () => { this.close(); v.handoff([tf]); }, true);
+    if (v.file) btn(`加到「${(v.settings.meta[v.file.path] || {}).sheet || v.file.basename}」的附件`, () => { this.close(); v.addAiAtts(v.file.path, [tf]); v.openTable(v.file); });
+    btn('复制文件路径', () => v.copyText(v.absPath(tf.path), '文件路径'));
     if (archiveKind(tf) === 'image') btn('复制图片', () => copyImageNotice(this.app, tf));
     btn('在 Obsidian 中打开', () => { this.close(); this.app.workspace.getLeaf('tab').openFile(tf); });
     if (this.app.openWithDefaultApp) btn('用默认程序打开', () => this.app.openWithDefaultApp(tf.path));
@@ -2079,12 +1602,19 @@ class LightboxModal extends Modal {
 }
 
 class TextPromptModal extends Modal {
-  constructor(app, title, value, onSubmit) { super(app); this.t = title; this.v = value || ''; this.onSubmit = onSubmit; }
+  constructor(app, title, value, onSubmit, copyOnly) { super(app); this.t = title; this.v = value || ''; this.onSubmit = onSubmit; this.copyOnly = copyOnly; }
   onOpen() {
     this.titleEl.setText(this.t);
-    const ta = this.contentEl.createEl('textarea', { cls: 'ata-path-input', attr: { rows: '3' } });
+    const ta = this.contentEl.createEl('textarea', { cls: 'ata-path-input', attr: { rows: this.copyOnly ? '14' : '3' } });
     ta.value = this.v;
     setTimeout(() => ta.focus(), 30);
+    if (this.copyOnly) {
+      new Setting(this.contentEl).addButton((b) => b.setButtonText('复制').setCta().onClick(async () => {
+        try { await navigator.clipboard.writeText(ta.value); new Notice('已复制。'); } catch (e) { ta.select(); document.execCommand('copy'); new Notice('已复制。'); }
+        this.close();
+      }));
+      return;
+    }
     new Setting(this.contentEl).addButton((b) => b.setButtonText('保存').setCta().onClick(() => { this.close(); this.onSubmit(ta.value.trim()); }));
   }
   onClose() { this.contentEl.empty(); }
@@ -2092,7 +1622,7 @@ class TextPromptModal extends Modal {
 
 /** 工作区里「从附件区选」 */
 class ArchivePickModal extends Modal {
-  constructor(app, view) { super(app); this.view = view; this.picked = new Set(); this.q = ''; }
+  constructor(app, view, onPick) { super(app); this.view = view; this.onPick = onPick; this.picked = new Set(); this.q = ''; }
   onOpen() {
     const v = this.view;
     this.modalEl.addClass('ata-route-modal');
@@ -2107,7 +1637,8 @@ class ArchivePickModal extends Modal {
       const files = v.archiveFiles().filter((f) => this.picked.has(f.path));
       if (!files.length) { new Notice('还没有选择文件。'); return; }
       this.close();
-      await v.archiveExtract(files, 'current');
+      if (this.onPick) this.onPick(files);
+      else if (v.file) { v.addAiAtts(v.file.path, files); v.renderAiPanel(); }
     });
     this.draw();
     search.focus();
@@ -2148,30 +1679,6 @@ class ConfirmModal extends Modal {
   onClose() { this.contentEl.empty(); }
 }
 
-class SheetPickModal extends Modal {
-  constructor(app, fileName, sheets, onSubmit) { super(app); this.fileName = fileName; this.sheets = sheets; this.onSubmit = onSubmit; }
-  onOpen() {
-    this.titleEl.setText(`「${this.fileName}」有 ${this.sheets.length} 个工作表`);
-    this.contentEl.createEl('p', { cls: 'setting-item-description', text: '选择要作为附件发给 AI 的工作表（选得越少越省钱，也越准确）：' });
-    const picked = new Set();
-    const list = this.contentEl.createDiv('ata-hr-list');
-    this.sheets.forEach((sh, i) => {
-      const row = list.createEl('label', { cls: 'ata-hr-row' });
-      const cb = row.createEl('input', { type: 'checkbox' });
-      row.createSpan({ cls: 'ata-hr-num', text: sh.name });
-      row.createSpan({ cls: 'ata-hr-text', text: `${sh.table.rows.length} 行 · ${sh.table.headers.slice(0, 6).join('、')}` });
-      cb.addEventListener('change', () => { if (cb.checked) picked.add(i); else picked.delete(i); });
-    });
-    new Setting(this.contentEl)
-      .addButton((b) => b.setButtonText('全选').onClick(() => { list.querySelectorAll('input').forEach((x, i) => { x.checked = true; picked.add(i); }); }))
-      .addButton((b) => b.setButtonText('添加所选').setCta().onClick(() => {
-        if (!picked.size) { new Notice('请至少选一个工作表。'); return; }
-        this.onSubmit([...picked].sort((a, b) => a - b).map((i) => this.sheets[i]));
-        this.close();
-      }));
-  }
-  onClose() { this.contentEl.empty(); }
-}
 
 class PathModal extends Modal {
   constructor(app, view) { super(app); this.view = view; }
@@ -2207,29 +1714,6 @@ class HeaderRowModal extends Modal {
   onClose() { this.contentEl.empty(); }
 }
 
-class ClassifyModal extends Modal {
-  constructor(app, count, uncategorized, onSubmit) {
-    super(app);
-    this.count = count;
-    this.uncategorized = uncategorized;
-    this.onSubmit = onSubmit;
-  }
-  onOpen() {
-    this.titleEl.setText('AI 归类表格文件');
-    let scope = this.uncategorized ? 'uncat' : 'all', cats = '';
-    this.contentEl.createEl('p', { cls: 'setting-item-description', text: 'AI 会读取每个表格的列名和前几行，给文件打上类别标签（不会移动或修改文件）。' });
-    new Setting(this.contentEl).setName('范围')
-      .addDropdown((d) => d.addOption('uncat', `仅未分类（${this.uncategorized} 个）`).addOption('all', `全部（${this.count} 个）`)
-        .setValue(scope).onChange((v) => (scope = v)));
-    new Setting(this.contentEl).setName('指定类别（可选）').setDesc('用逗号分隔；留空则由 AI 自行归纳。')
-      .addText((t) => t.setPlaceholder('收入, 费用, 银行流水, 发票').onChange((v) => (cats = v)));
-    new Setting(this.contentEl).addButton((b) => b.setButtonText('开始归类').setCta().onClick(() => {
-      this.close();
-      this.onSubmit(scope, cats.split(/[,，、]/).map((s) => s.trim()).filter(Boolean));
-    }));
-  }
-  onClose() { this.contentEl.empty(); }
-}
 
 /* ====================================================================
  * 四、工作台面板
@@ -2259,12 +1743,7 @@ class TableWorkbenchView extends ItemView {
     this.table = { headers: [], rows: [] };
     this.file = null;
     this.undoStack = [];
-    this.histories = new Map();
-    this.chatLogs = new Map();
-    this.attachments = [];
     this.undoMap = new Map();   // 每张表各自的撤销记录
-    this.attachMap = new Map(); // 每张表各自的待发附件
-    this.busy = false;
     this.importing = null;
   }
   getViewType() { return VIEW_TYPE; }
@@ -2284,7 +1763,7 @@ class TableWorkbenchView extends ItemView {
       const el = e.target && e.target.closest ? e.target : null;
       if (!el) return null;
       if (el.closest('.ata-archive')) return 'archive';
-      if (el.closest('.ata-chatpanel')) return 'chat';
+      if (el.closest('.ata-aipanel')) return 'ai';
       const card = el.closest('[data-drop-table]');
       if (card) return 'table:' + card.getAttribute('data-drop-table');
       if (el.closest('.ata-inbox')) return 'inbox';
@@ -2316,7 +1795,7 @@ class TableWorkbenchView extends ItemView {
       e.dataTransfer.dropEffect = 'copy';
       const z = zoneOf(e);
       this.root.toggleClass('ata-over-master', z === 'inbox');
-      this.root.toggleClass('ata-over-chat', z === 'chat');
+      this.root.toggleClass('ata-over-chat', z === 'ai');
       const card = e.target && e.target.closest ? e.target.closest('[data-drop-table]') : null;
       if (card !== this.overCard) {
         if (this.overCard) this.overCard.removeClass('is-drop-over');
@@ -2364,7 +1843,6 @@ class TableWorkbenchView extends ItemView {
       const editable = tgt && (tgt.closest && (tgt.closest('textarea, input, [contenteditable="true"]')));
       const cd = e.clipboardData;
       const files = Array.from((cd && cd.files) || []);
-      if (editable && editable.tagName === 'TEXTAREA' && editable.closest('.ata-chatpanel')) return; // 对话框自己处理
       let paths = [];
       if (!files.length) {
         paths = parsePaths(cd ? cd.getData('text/plain') : '');
@@ -2391,48 +1869,69 @@ class TableWorkbenchView extends ItemView {
       this.importBatch(files.map((f) => ({ file: f, rel: f.name }))));
     this.folderInput = this.makeInput({ webkitdirectory: 'true', multiple: 'true' }, (files) =>
       this.importBatch(files.map((f) => ({ file: f, rel: f.webkitRelativePath || f.name }))));
-    this.attachInput = this.makeInput({ accept: 'image/*,.pdf,.csv,.tsv,.xlsx,.xlsm,.md', multiple: 'true' }, (files) => {
-      if (this.pendingRoute) { this.pendingRoute = false; this.receive(files.map((f) => ({ file: f, rel: f.name }))); }
-      else this.addAttachments(files);
+    /* 首页「收到单据」：任何文件都先存进附件区，再选要填的表 */
+    this.attachInput = this.makeInput({ multiple: 'true' }, (files) => this.receiveAtts(files.map((f) => ({ file: f, rel: f.name })), null));
+    /* 工作区右侧「交给外部 AI」上传附件 */
+    this.aiInput = this.makeInput({ multiple: 'true' }, async (files) => {
+      const path = this.aiUploadFor || (this.file && this.file.path);
+      const saved = await this.archiveSave(files, '上传', true);
+      if (path && saved.length) { this.addAiAtts(path, saved); new Notice(`已存入附件区并加到附件：${saved.map((f) => f.name).join('、')}`); }
+      this.renderAiPanel();
     });
 
-    this.registerEvent(this.app.vault.on('modify', (f) => this.onVaultChange(f)));
-    this.registerEvent(this.app.vault.on('create', (f) => this.onVaultChange(f)));
-    this.registerEvent(this.app.vault.on('delete', (f) => {
-      if (this.file && f.path === this.file.path) { this.file = null; this.table = { headers: [], rows: [] }; }
+    /* 监视表格文件：外部（AI 或其它程序）改了，就对比出改动，标出来让用户确认或撤销 */
+    this.registerEvent(this.app.vault.on('modify', (f) => {
+      if (this.snapReady && this.isTableFile(f)) this.checkFile(f, 'modify');
       this.onVaultChange(f);
     }));
-    this.registerEvent(this.app.vault.on('rename', () => this.scheduleRender()));
+    this.registerEvent(this.app.vault.on('create', (f) => {
+      if (this.snapReady && !this.importRun && this.isTableFile(f)) setTimeout(() => this.checkFile(f, 'create'), 300);
+      this.onVaultChange(f);
+    }));
+    this.registerEvent(this.app.vault.on('delete', (f) => {
+      if (this.file && f.path === this.file.path) { this.file = null; this.table = { headers: [], rows: [] }; }
+      this.onExtDelete(f);
+      this.onVaultChange(f);
+    }));
+    this.registerEvent(this.app.vault.on('rename', (f, old) => { this.onExtRename(f, old); this.scheduleRender(); }));
 
     const last = this.settings.lastTable && this.app.vault.getAbstractFileByPath(this.settings.lastTable);
     if (last instanceof TFile) await this.loadFile(last, { silent: true, switchTab: false });
     await this.render();
     this.register(() => this.endTour(false));
     if (!this.settings.onboarded) setTimeout(() => this.startTour(), 600);
+    /* 找出工作台关着时被外部改过的表，并更新给 AI 看的说明文件 */
+    setTimeout(async () => {
+      try { await this.scanExternal(); } catch (e) { console.warn('[AI表格助手] 检查外部修改失败', e); this.snapReady = true; }
+      try { await this.writeAiGuide(); } catch (e) { console.warn('[AI表格助手] 写说明文件失败', e); }
+    }, 300);
   }
 
   /* ================= 新手引导 ================= */
   tourSteps() {
     const toTab = (t) => async () => { if (this.tab !== t) { this.tab = t; await this.render(); } };
+    const ws = async () => { if (this.file) await toTab('workspace')(); };
     return [
       { kind: 'welcome' },
       { sel: '.ata-tabs', title: '四个页面', before: toTab('home'),
-        text: '「首页」看最近做了什么；「表格库」放所有表格（多工作表的 Excel 会归在一起）；「工作区」是打开一张表和 AI 一起填；「附件区」存收到的单据、截图、PDF。' },
+        text: '「首页」看最近发生了什么，包括外部 AI 改了哪些表；「表格库」放所有表格（多工作表的 Excel 会归在一起）；「工作区」打开一张表查看和修改；「附件区」存收到的单据、截图、PDF。' },
       { sel: '.ata-top-actions', title: '第一步：导入你的表格', before: toTab('home'),
-        text: '点「导入文件」或「导入文件夹」，把平时要填的 Excel / CSV 导进来，一次可以导很多个。从微信里拖不进来时，复制文件后在这里按 Ctrl+V，或点「按路径」粘贴文件路径。' },
+        text: '点「导入文件」或「导入文件夹」，把平时要填的 Excel / CSV 导进来。导入后每张表都是库里的一个 CSV 文件，外部 AI 可以直接读写。从微信拖不进来时，复制文件后在这里按 Ctrl+V，或点「按路径」。' },
       { sel: '.ata-homestrip .ata-inbox', title: '收到单据就丢这里', before: toTab('home'),
-        text: '订单、送货单、价格表的截图或 PDF 拖到这里（或点一下选择），插件会推荐该填哪张表，选好后 AI 自动识别内容填进去。' },
+        text: '订单、送货单、价格表的截图或 PDF 拖到这里（或点一下选择）。文件会存进附件区，然后选要填哪张表，打开后附件已经放好。' },
       { sel: '.ata-qstrip', title: '常用表一键切换', before: toTab('home'), optional: true,
-        text: '最近用过和设为常用的表会排在这里，点一下就切过去。也可以把单据直接拖到某个表名上，直接填那张表。' },
+        text: '最近用过和设为常用的表排在这里，点一下就切过去。也可以把单据直接拖到某个表名上。' },
       { sel: '.ata-oplog', title: '操作记录', before: toTab('home'),
-        text: 'AI 改了什么、你手动改了什么、导入导出和删除，都会按时间记在这里。点「查看明细」能看到每个格子原来是什么、改成了什么。' },
-      { sel: '.ata-chatpanel', title: '和 AI 一起填表', before: async () => { if (this.file) await toTab('workspace')(); }, needs: () => !!this.file,
-        alt: { sel: '.ata-tabs', text: '打开任意一张表后，「工作区」右边是 AI 对话框：用中文说要改什么，或者点回形针加图片 / PDF，AI 会给出修改。打开一张表后可以在设置里重新看这段引导。' },
-        text: '在这里用中文告诉 AI 要做什么，比如「把这张送货单加进去」「把单价都改成含税价」。点回形针可以加图片、PDF、表格。AI 改完会先标出来（黄色是修改，绿色是新增），确认后点「应用」，不满意可以「撤销」。' },
-      { sel: '.ata-export-btn', title: '导出成 Excel', before: async () => { if (this.file) await toTab('workspace')(); }, needs: () => !!this.file,
+        text: '外部 AI 改了什么、你手动改了什么、导入导出和删除，都按时间记在这里。外部修改可以点「查看明细」看每个格子原来是什么、改成了什么，再确认或撤销。' },
+      { sel: '.ata-aipanel', title: '交给外部 AI', before: ws, needs: () => !!this.file,
+        alt: { sel: '.ata-tabs', text: '打开任意一张表后，「工作区」右边是「交给外部 AI」面板：写要求、加附件，点「复制给 AI 的指令」，粘贴给能读写电脑文件的 AI（例如 Claude 桌面版、Claude Code、Codex）。' },
+        text: '写下要求（或点上面的常用要求），加上单据附件，点「复制给 AI 的指令」，粘贴给能读写电脑文件的 AI，例如 Claude 桌面版连上这个文件夹、Claude Code、Codex。指令里已经写好了表格和附件的完整路径，以及修改规则。' },
+      { sel: '.ata-tablepane', title: 'AI 改完会自动显示', before: ws, needs: () => !!this.file,
+        text: 'AI 改完文件，这里会立刻刷新：绿色是新增的行，黄色是改过的格子，上方出现提示条，可以「确认」或「撤销」。你也可以直接在表格里手动改。' },
+      { sel: '.ata-export-btn', title: '导出成 Excel', before: ws, needs: () => !!this.file,
         text: '改好后点「导出」。从 Excel 导入的表会按原文件的格式导出：颜色、公式、合并单元格、图片都保留，多个工作表一起导出成一个文件。' },
       { sel: '.ata-archive-drop', title: '附件区', before: toTab('archive'),
-        text: '收到的文件可以先存在这里，图片和 PDF 有预览，图片能一键复制。要用时点卡片上的「送去提取」，交给 AI 填到表里。发给 AI 的附件也会自动存一份。' },
+        text: '收到的文件都存在这里，图片和 PDF 有预览，图片能一键复制。点卡片上的「交给 AI」，选一张表就能把它作为附件交给外部 AI。' },
       { kind: 'done' },
     ];
   }
@@ -2521,9 +2020,14 @@ class TableWorkbenchView extends ItemView {
     const h = Math.min(r.bottom + pad, vh - 4) - top, w = Math.min(r.right + pad, vw - 4) - left;
     Object.assign(hole.style, { display: 'block', top: top + 'px', left: left + 'px', width: w + 'px', height: Math.max(h, 20) + 'px' });
     const cw = card.offsetWidth || 360, chh = card.offsetHeight || 200;
-    if (h > vh * 0.5 && left - cw - 16 > 8) { // 很高的目标（比如对话框）：卡片放在它左边
-      card.style.left = (left - cw - 16) + 'px';
+    if (h > vh * 0.5 && (left - cw - 16 > 8 || left + w + cw + 16 < vw)) { // 很高的目标：卡片放在它旁边
+      card.style.left = (left - cw - 16 > 8 ? left - cw - 16 : left + w + 16) + 'px';
       card.style.top = Math.max(8, Math.min(top + 40, vh - chh - 8)) + 'px';
+      return;
+    }
+    if (h > vh * 0.5) { // 旁边放不下：盖在目标中间偏下，不挡住开头
+      card.style.left = Math.max(8, left + w / 2 - cw / 2) + 'px';
+      card.style.top = Math.max(8, Math.min(top + h * 0.45, vh - chh - 8)) + 'px';
       return;
     }
     let cy = top + h + 12;
@@ -2536,53 +2040,38 @@ class TableWorkbenchView extends ItemView {
   }
 
   tourWelcome(card) {
-    const s = this.settings;
     card.addClass('is-wide');
-    card.createDiv({ cls: 'ata-tour-title big', text: '欢迎使用 AI 表格助手 👋' });
-    card.createDiv({ cls: 'ata-tour-text', text: '收到订单、送货单、价格表时，不用再自己翻表格一格格填：拖进来，AI 识别内容、找到对应的表、填好，改完按原格式导出 Excel。' });
+    card.createDiv({ cls: 'ata-tour-title big', text: '欢迎使用表格工作台 👋' });
+    card.createDiv({ cls: 'ata-tour-text', text: 'Obsidian 负责存放和展示表格；识别单据、填表这些活交给你自己用的 AI（Claude、ChatGPT 等）。AI 直接修改库里的表格文件，改了哪里这里会标出来，你确认或撤销，最后按原格式导出 Excel。' });
     const flow = card.createDiv('ata-tour-flow');
-    [['folder-down', '导入表格'], ['inbox', '丢进单据'], ['sparkles', 'AI 填表'], ['check', '确认修改'], ['download', '导出 Excel']].forEach(([ic, tx], i) => {
+    [['folder-down', '导入表格'], ['inbox', '存进单据'], ['clipboard-copy', '复制指令给 AI'], ['bot', 'AI 改文件'], ['check', '确认 / 撤销'], ['download', '导出 Excel']].forEach(([ic, tx], i) => {
       if (i) flow.createSpan({ cls: 'ata-tour-arrow', text: '→' });
       const c = flow.createDiv('ata-tour-flowitem');
       setIcon(c.createDiv('ata-tour-flowicon'), ic);
       c.createSpan({ text: tx });
     });
     const box = card.createDiv('ata-tour-setup');
-    box.createDiv({ cls: 'ata-tour-sub', text: '先连上 AI（只需要一次）' });
-    const row1 = box.createDiv('ata-tour-row');
-    row1.createSpan({ text: 'AI 服务' });
-    const sel = row1.createEl('select', { cls: 'dropdown' });
-    Object.keys(PROVIDER_DEFAULTS).forEach((k) => sel.createEl('option', { attr: { value: k }, text: PROVIDER_DEFAULTS[k].label }));
-    sel.value = providerOf(s);
-    const row2 = box.createDiv('ata-tour-row');
-    row2.createSpan({ text: 'API Key' });
-    const key = row2.createEl('input', { attr: { type: 'password', placeholder: s.apiKey ? '已填写（不改就留空）' : '粘贴你的 API Key' } });
-    const hint = box.createDiv({ cls: 'ata-tour-hint' });
-    const setHint = () => hint.setText(sel.value === 'deepseek' ? 'DeepSeek 在 platform.deepseek.com 注册后创建 API Key，价格便宜，能识别图片。'
-      : sel.value === 'anthropic' ? 'Claude 在 console.anthropic.com 创建 API Key，识别图片和 PDF 效果最好。'
-        : '通义千问、Kimi、豆包等兼容 OpenAI 接口的服务，接口地址和模型可以之后在设置里填。');
-    setHint();
-    sel.addEventListener('change', setHint);
-    if (s.apiKey) box.createDiv({ cls: 'ata-tour-ok', text: `✓ 已经配置好 ${PROVIDER_DEFAULTS[providerOf(s)].label}，可以直接开始` });
-    box.createDiv({ cls: 'ata-tour-hint', text: 'Key 只保存在你自己的库里。现在不填也可以，之后在「设置」里填。' });
-    const saveAi = async () => {
-      if (sel.value !== providerOf(s)) { s.provider = sel.value; s.baseUrl = ''; s.model = ''; }
-      if (key.value.trim()) s.apiKey = key.value.trim();
-      await this.plugin.saveSettings();
-    };
+    box.createDiv({ cls: 'ata-tour-sub', text: '需要什么样的 AI？' });
+    box.createDiv({ cls: 'ata-tour-hint', text: '能直接读写你电脑上文件的 AI 工具，例如：Claude 桌面版（把下面这个文件夹连给它）、Claude Code、Codex 等。网页版聊天读不到你电脑上的文件。' });
+    const row = box.createDiv('ata-tour-row');
+    row.createSpan({ text: '表格文件夹' });
+    const path = this.absPath(normalizePath(this.settings.folder));
+    const pv = row.createEl('code', { cls: 'ata-tour-path', text: path });
+    pv.addEventListener('click', () => this.copyText(path, '文件夹路径'));
+    box.createDiv({ cls: 'ata-tour-hint', text: '插件会在这个文件夹里放一份「AI使用说明.md」和「表格目录.md」，AI 读了就知道表格在哪、怎么改。点上面的路径可以复制。' });
     const bar = card.createDiv('ata-tour-bar');
     const skip = bar.createEl('button', { cls: 'ata-tour-skip', text: '跳过，我自己摸索' });
-    skip.addEventListener('click', async () => { await saveAi(); this.endTour(true); });
+    skip.addEventListener('click', () => this.endTour(true));
     const go = bar.createDiv('ata-tour-btns').createEl('button', { cls: 'mod-cta', text: '开始 1 分钟导览 →' });
-    go.addEventListener('click', async () => { await saveAi(); this.tourGo(1); });
+    go.addEventListener('click', () => this.tourGo(1));
   }
 
   tourDone(card) {
     card.addClass('is-wide');
     card.createDiv({ cls: 'ata-tour-title big', text: '可以开始了 🎉' });
-    card.createDiv({ cls: 'ata-tour-text', text: '建议先导入一张你平时要填的表，然后把一张单据截图拖进来试试。也可以先用示例表练练手：' });
+    card.createDiv({ cls: 'ata-tour-text', text: '建议先导入一张你平时要填的表，再把一张单据交给 AI 试试。也可以先用示例表练手：' });
     const ul = card.createEl('ul', { cls: 'ata-tour-list' });
-    ['示例表里已经有两条送货记录', '对话框里填好了一句示例指令，直接点发送', 'AI 会新增一行并标成绿色，点「应用」就写进表里'].forEach((x) => ul.createEl('li', { text: x }));
+    ['示例表里有两条送货记录，右边已经写好一句示例要求', '点「复制给 AI 的指令」，粘贴给你的 AI', 'AI 改完文件，新增的行会标成绿色，点「确认」或「撤销」'].forEach((x) => ul.createEl('li', { text: x }));
     card.createDiv({ cls: 'ata-tour-hint', text: '以后想再看这个引导：点顶部的「引导」按钮，或在插件设置里点「重新查看使用引导」。' });
     const bar = card.createDiv('ata-tour-bar');
     const sp = bar.createDiv('ata-tour-btns');
@@ -2603,16 +2092,12 @@ class TableWorkbenchView extends ItemView {
     try {
       await this.ensureFolder(this.settings.folder);
       const path = await this.uniquePath(this.settings.folder, '示例-送货记录', 'csv');
+      await this.snapPut(path, toCSV(t));
       const file = await this.app.vault.create(path, toCSV(t));
       this.logOp({ type: 'create', path: file.path, text: '新建示例表（新手引导）' });
-      const ask = `帮我加一条：${day(0)} 华盛布行 又送了棉布 280克 200米，单价 8.5，金额算一下`;
-      this.pendingPrompt = ask;
+      this.aiState(file.path).ask = `帮我加一条：${day(0)} 华盛布行 又送了棉布 280克 200米，单价 8.5，金额自己算好。`;
       await this.openTable(file);
-      setTimeout(() => { /* 新建文件会触发一次重绘，等它画完再把示例指令填进去 */
-        if (this.inputEl && this.inputEl.isConnected && !this.inputEl.value.trim()) { this.inputEl.value = ask; this.inputEl.focus(); }
-        this.pendingPrompt = null;
-      }, 600);
-      new Notice('示例表已经建好，直接点发送试试。');
+      new Notice('示例表已经建好，右边点「复制给 AI 的指令」试试。');
     } catch (e) { new Notice('创建示例表失败：' + (e.message || e)); }
   }
 
@@ -2640,13 +2125,26 @@ class TableWorkbenchView extends ItemView {
     return false;
   }
 
-  /** 粘贴 / 按路径收到的文件：只有一种明显去向时直接处理，否则让用户选 */
+  /** 粘贴 / 按路径收到的文件：全是表格或整个文件夹就导入；有单据、截图就存进附件区交给 AI */
   async receive(list) {
     list = (list || []).filter(Boolean);
     if (!list.length) { new Notice('没有读到文件。'); return; }
-    if (list.some((x) => x.rel.includes('/'))) { await this.importBatch(list); return; }
-    if (!list.some((x) => TABLE_EXT.test(x.file.name) || isImageFile(x.file) || isPdfFile(x.file))) { new Notice('没有可以处理的表格、图片或 PDF。'); return; }
-    new RouteModal(this.app, this, list).open();
+    const isFolder = list.some((x) => x.rel.includes('/'));
+    if (isFolder || list.every((x) => TABLE_EXT.test(x.file.name))) { await this.importBatch(list); return; }
+    await this.receiveAtts(list, this.tab === 'workspace' && this.file ? this.file : null);
+  }
+
+  /** 存进附件区，加到某张表的附件里（没指定表就让用户选） */
+  async receiveAtts(list, target) {
+    const saved = await this.archiveSave(list.map((x) => x.file || x).filter((f) => f && f.size > 0), '收到', true);
+    if (!saved.length) { new Notice('没有读到文件内容。'); return; }
+    if (target && this.file && target.path === this.file.path && this.tab === 'workspace') {
+      this.addAiAtts(target.path, saved);
+      this.renderAiPanel();
+      new Notice(`已存入附件区，并加到这张表的附件：${saved.map((f) => f.name).join('、')}`);
+      return;
+    }
+    await this.handoff(saved, target);
   }
 
   makeInput(attrs, onFiles) {
@@ -2674,20 +2172,7 @@ class TableWorkbenchView extends ItemView {
 
   /* ---------- 表格库数据 ---------- */
   tableFiles() {
-    const folder = normalizePath(this.settings.folder) + '/';
-    const meta = this.settings.meta || {};
-    const arch = this.archiveDir() + '/';
-    return this.app.vault.getFiles().filter((f) => {
-      if (f.path.startsWith(arch)) return false;
-      if (f.extension === 'csv') return !f.path.startsWith(folder + '导出/');
-      if (f.extension === 'md') {
-        if (f.path.startsWith(folder + '导出/')) return false;
-        if (!(f.path.startsWith(folder) || meta[f.path])) return false;
-        const cache = this.app.metadataCache.getFileCache(f);
-        return !cache || !cache.sections || cache.sections.some((s) => s.type === 'table');
-      }
-      return false;
-    });
+    return this.app.vault.getFiles().filter((f) => this.isTableFile(f));
   }
 
   async statOf(f) {
@@ -2877,7 +2362,6 @@ class TableWorkbenchView extends ItemView {
     const weekAgo = Date.now() - 7 * 86400000;
     left.createDiv({ cls: 'ata-sub', text: `${sp.singles.length + sp.books.length} 个表格${sp.books.length ? `（${sp.books.length} 个 Excel 工作簿）` : ''} · ${lib.reduce((a, t) => a + t.rows, 0).toLocaleString()} 行数据 · 本周改过 ${lib.filter((t) => t.mtime > weekAgo).length} 张 · 附件 ${this.archiveFiles().length} 个` });
     const right = head.createDiv('ata-header-right');
-    this.btn(right, 'AI 归类', 'sparkles', () => this.classifyDialog());
     this.btn(right, '新建表格', 'plus', () => new NewTableModal(this.app, (n, c, f) => this.createTable(n, c, f)).open(), 'mod-cta');
 
     /* 两个小入口：收到单据 / 导入表格 */
@@ -2886,8 +2370,8 @@ class TableWorkbenchView extends ItemView {
     this.ico(ib, 'inbox', 'ata-dropzone-icon');
     const t1 = ib.createDiv('ata-dropzone-text');
     t1.createEl('b', { text: '收到单据 / 截图 / 价格表' });
-    t1.createSpan({ text: '拖到这里或点击，自动找到要填的表' });
-    ib.addEventListener('click', () => { this.pendingRoute = true; this.attachInput.click(); });
+    t1.createSpan({ text: '拖到这里或点击：存进附件区，选好要填的表，复制指令交给 AI' });
+    ib.addEventListener('click', () => this.attachInput.click());
     const dz = strip.createDiv('ata-dropzone ata-mini');
     this.ico(dz, 'folder-down', 'ata-dropzone-icon');
     const t2 = dz.createDiv('ata-dropzone-text');
@@ -2913,48 +2397,8 @@ class TableWorkbenchView extends ItemView {
     this.renderOpLog(body);
   }
 
-  masterFile() { return null; }
 
-  renderInbox(body) {
-    const box = body.createDiv('ata-inbox');
-    this.ico(box, 'inbox', 'ata-dropzone-icon');
-    const txt = box.createDiv('ata-dropzone-text');
-    txt.createEl('b', { text: '拿到新的单据 / 送货单 / 价格表 / 截图？拖到这里 → 自动找到要填的表' });
-    txt.createSpan({ text: '支持图片、PDF、Excel、CSV，可一次拖多个。表格文件按列名比对，图片和 PDF 由 AI 看一眼判断；推荐结果点一下就跳过去，附件和指令都带好。已经知道填哪张表，就直接拖到下面那张表的卡片上。' });
-    box.addEventListener('click', () => { this.pendingRoute = true; this.attachInput.click(); });
-  }
 
-  /** 常用 + 最近：可点击切换、可拖文件进去 */
-  renderQuickTables(body, lib) {
-    const files = this.recentFiles(12);
-    const sec = body.createDiv('ata-section');
-    const h = sec.createDiv('ata-section-head');
-    const t = h.createDiv('ata-section-title');
-    this.ico(t, 'layers');
-    t.createSpan({ text: '常用和最近的表' });
-    h.createDiv({ cls: 'ata-muted', text: '点击切换；把单据拖到卡片上就直接填这张表；☆ 设为常用' });
-    if (!files.length) {
-      sec.createDiv({ cls: 'ata-empty-sm', text: '还没有打开过表格。去「表格库」点开一张，它就会出现在这里。' });
-      return;
-    }
-    const grid = sec.createDiv('ata-qgrid');
-    const byPath = new Map(lib.map((x) => [x.file.path, x]));
-    const meta = this.settings.meta || {};
-    files.forEach((f) => {
-      const st = byPath.get(f.path);
-      const m = meta[f.path] || {};
-      const c = grid.createDiv('ata-qcard' + (this.file && this.file.path === f.path ? ' is-current' : ''));
-      c.setAttribute('data-drop-table', f.path);
-      const top = c.createDiv('ata-qcard-top');
-      const star = top.createEl('button', { cls: 'ata-qstar' + (this.isPinned(f.path) ? ' is-on' : ''), text: this.isPinned(f.path) ? '★' : '☆', attr: { 'aria-label': this.isPinned(f.path) ? '取消常用' : '设为常用' } });
-      star.addEventListener('click', (e) => { e.stopPropagation(); this.togglePin(f); });
-      top.createDiv({ cls: 'ata-qcard-title', text: m.sheet || f.basename });
-      c.createDiv({ cls: 'ata-qcard-sub', text: m.workbook ? `📗 ${m.workbook}` : (f.parent && f.parent.path !== '/' ? f.parent.path : '') });
-      c.createDiv({ cls: 'ata-qcard-cols', text: st ? `${st.rows} 行 · ${st.headers.slice(0, 5).join('、')}` : '' });
-      c.createDiv({ cls: 'ata-qcard-drop', text: '松开 → 填进这张表' });
-      c.addEventListener('click', () => this.openTable(f));
-    });
-  }
 
   /** 工作区顶部：常用 + 最近，像浏览器标签一样切换 */
   renderSwitchBar(body) {
@@ -2969,8 +2413,8 @@ class TableWorkbenchView extends ItemView {
       if (this.isPinned(f.path)) b.createSpan({ cls: 'ata-star', text: '★' });
       b.createSpan({ text: m.sheet ? `${m.sheet}` : f.basename });
       if (m.workbook) b.title = `${m.workbook} · ${m.sheet}`;
-      const pending = this.attachMap.get(f.path);
-      if (pending && pending.length) b.createSpan({ cls: 'ata-tab-count', text: String(pending.length) });
+      const pending = this.pendingFor(f.path).length;
+      if (pending) b.createSpan({ cls: 'ata-tab-count is-ext', text: String(pending), attr: { title: '有待确认的外部修改' } });
       b.addEventListener('click', () => { if (!this.file || f.path !== this.file.path) this.openTable(f); });
     });
     const more = bar.createEl('button', { cls: 'ata-switch ata-switch-more', text: '更多…' });
@@ -3040,7 +2484,6 @@ class TableWorkbenchView extends ItemView {
       this.selected = new Set();
       this.render();
     });
-    this.btn(right, 'AI 归类', 'sparkles', () => this.classifyDialog());
     this.btn(right, '导入文件夹', 'folder-up', () => this.folderInput.click(), 'mod-cta');
 
     if (!lib.length) {
@@ -3292,6 +2735,8 @@ class TableWorkbenchView extends ItemView {
 
     /* 左：表格（工作表标签在表格下方，和 Excel 一样） */
     const tablePane = ws.createDiv('ata-tablepane');
+    this.reviewEl = tablePane.createDiv('ata-review');
+    this.renderReview();
     this.previewEl = tablePane.createDiv('ata-tablewrap');
     this.renderSheetTabs(tablePane);
     const foot = tablePane.createDiv('ata-tablefoot');
@@ -3301,48 +2746,9 @@ class TableWorkbenchView extends ItemView {
     this.statEl = foot.createDiv({ cls: 'ata-muted ata-spacer-left' });
     this.renderTable();
 
-    /* 右：AI 对话 */
-    const chat = ws.createDiv('ata-chatpanel');
-    const ch = chat.createDiv('ata-chat-head');
-    this.ico(ch, 'bot');
-    ch.createSpan({ text: 'AI 助手' });
-    ch.createSpan({ cls: 'ata-muted', text: (this.settings.model || PROVIDER_DEFAULTS[providerOf(this.settings)].model) });
-    this.iconBtn(ch, 'eraser', '清空对话', () => {
-      this.histories.delete(this.file.path);
-      this.chatLogs.delete(this.file.path);
-      this.renderChatLog();
-    }).addClass('ata-ml-auto');
-
-    this.chatEl = chat.createDiv('ata-chat');
-    this.renderChatLog();
-
-    const chips = chat.createDiv('ata-chips ata-prompts');
-    const p = (label, text) => chips.createEl('button', { text: label, cls: 'ata-catchip' })
-      .addEventListener('click', () => { this.inputEl.value = text; this.inputEl.focus(); });
-    p('合并附件到本表', MASTER_PROMPT);
-    p('识别单据录入', '请识别图片 / PDF 里的单据内容，按本表的列整理后录入（按关键列匹配：已有的更新，没有的新增）。');
-    p('按内容分类', '请根据每一行的内容进行分类，新增一列「分类」，并把同类排在一起。');
-    p('检查数据', '请检查表格里有没有明显的错误、重复行、空缺或格式不统一的地方，先列出来，不要改表。');
-
-    this.attachEl = chat.createDiv('ata-attach');
-    this.renderAttachments();
-
-    const inputRow = chat.createDiv('ata-input');
-    this.iconBtn(inputRow, 'paperclip', '添加图片、PDF 或表格附件', () => { this.pendingRoute = false; this.attachInput.click(); });
-    this.iconBtn(inputRow, 'archive', '从附件区选', () => new ArchivePickModal(this.app, this).open());
-    this.inputEl = inputRow.createEl('textarea', { attr: { rows: '2', placeholder: '输入要求；图片 / PDF / 表格可粘贴或拖到这里…' } });
-    if (this.pendingPrompt) { this.inputEl.value = this.pendingPrompt; this.pendingPrompt = null; setTimeout(() => this.inputEl.focus(), 50); }
-    this.inputEl.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !Platform.isMobile) { e.preventDefault(); this.send(); }
-    });
-    this.inputEl.addEventListener('paste', async (e) => {
-      const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
-      if (files.length) { e.preventDefault(); await this.addAttachments(files); }
-    });
-    this.sendBtn = inputRow.createEl('button', { cls: 'ata-send', attr: { 'aria-label': '发送（Enter）' } });
-    setIcon(this.sendBtn, 'send');
-    this.sendBtn.disabled = this.busy;
-    this.sendBtn.addEventListener('click', () => this.send());
+    /* 右：交给外部 AI */
+    this.aiPanelEl = ws.createDiv('ata-chatpanel ata-aipanel');
+    this.renderAiPanel();
   }
 
   /** 工作区高度按窗口实际剩余空间计算，保证表格底部的工作表标签和按钮栏都看得到 */
@@ -3395,6 +2801,529 @@ class TableWorkbenchView extends ItemView {
   /* ---------- 和原 Excel 的对应关系（保存在表格库的隐藏文件夹 .ata 里） ---------- */
   ataDir() { return normalizePath(this.settings.folder) + '/.ata'; }
 
+  /* ================= 外部修改：快照、对比、确认、撤销 ================= */
+  isTableFile(f) {
+    if (!(f instanceof TFile)) return false;
+    const folder = normalizePath(this.settings.folder) + '/';
+    if (f.path.startsWith(this.archiveDir() + '/') || f.path.startsWith(folder + '导出/')) return false;
+    if (f.path.startsWith(folder) && GUIDE_FILES.includes(f.path.slice(folder.length))) return false;
+    if (f.extension === 'csv') return true;
+    if (f.extension === 'md') {
+      const meta = this.settings.meta || {};
+      if (!(f.path.startsWith(folder) || meta[f.path])) return false;
+      const cache = this.app.metadataCache.getFileCache(f);
+      return !cache || !cache.sections || cache.sections.some((s) => s.type === 'table');
+    }
+    return false;
+  }
+
+  snapDir() { return this.ataDir() + '/snap'; }
+
+  async snapIndex() {
+    if (this.snapIdx) return this.snapIdx;
+    try { this.snapIdx = JSON.parse(await this.app.vault.adapter.read(this.snapDir() + '/index.json')); this.snapFresh = false; }
+    catch (e) { this.snapIdx = {}; this.snapFresh = true; }
+    if (!this.snapText) this.snapText = new Map();
+    return this.snapIdx;
+  }
+
+  saveSnapIndex() {
+    clearTimeout(this.snapIdxTimer);
+    this.snapIdxTimer = setTimeout(async () => {
+      try { await this.ensureAdapterDir(this.snapDir()); await this.app.vault.adapter.write(this.snapDir() + '/index.json', JSON.stringify(this.snapIdx)); }
+      catch (e) { console.warn('[AI表格助手] 保存快照索引失败', e); }
+    }, 500);
+  }
+
+  /** 记下「插件自己写进去的内容」：之后文件变成别的样子，就是外部改的 */
+  async snapPut(path, text, stat) {
+    const idx = await this.snapIndex();
+    const e = idx[path] || (idx[path] = { k: hashStr(path + '|' + Date.now()).slice(0, 12) });
+    e.h = hashStr(text);
+    e.n = this.tableLabel(path);
+    if (stat) { e.m = stat.mtime; e.s = stat.size; } else { e.m = 0; e.s = -1; }
+    this.snapText.set(path, text);
+    try {
+      await this.ensureAdapterDir(this.snapDir());
+      await this.app.vault.adapter.write(`${this.snapDir()}/${e.k}.txt`, text);
+    } catch (err) { console.warn('[AI表格助手] 保存快照失败', err); }
+    this.saveSnapIndex();
+  }
+
+  async snapGet(path) {
+    const idx = await this.snapIndex();
+    if (this.snapText.has(path)) return this.snapText.get(path);
+    const e = idx[path];
+    if (!e) return null;
+    try { const t = await this.app.vault.adapter.read(`${this.snapDir()}/${e.k}.txt`); this.snapText.set(path, t); return t; }
+    catch (err) { return null; }
+  }
+
+  async snapDrop(path) {
+    const idx = await this.snapIndex();
+    const e = idx[path];
+    if (!e) return;
+    delete idx[path];
+    this.snapText.delete(path);
+    try { await this.app.vault.adapter.remove(`${this.snapDir()}/${e.k}.txt`); } catch (err) { /* 已经没有了 */ }
+    this.saveSnapIndex();
+  }
+
+  parseTableText(f, text) {
+    if (f.extension === 'md') { const m = findMdTable(text); return m ? m.table : { headers: [], rows: [] }; }
+    return gridToTable(parseCSV(text));
+  }
+
+  /** 每个文件的检查排队进行，避免同一个文件连着改两次时乱序 */
+  queueCheck(path, fn) {
+    if (!this.checkQ) this.checkQ = new Map();
+    const prev = this.checkQ.get(path) || Promise.resolve();
+    const next = prev.then(fn).catch((e) => console.warn('[AI表格助手] 检查外部修改失败', e));
+    this.checkQ.set(path, next);
+    next.then(() => { if (this.checkQ.get(path) === next) this.checkQ.delete(path); });
+    return next;
+  }
+
+  async checkFile(f, why) {
+    if (!this.isTableFile(f)) return;
+    await this.queueCheck(f.path, async () => {
+      const idx = await this.snapIndex();
+      const text = await this.app.vault.read(f);
+      const e = idx[f.path];
+      const old = e ? await this.snapGet(f.path) : null;
+      if (old == null) {
+        await this.snapPut(f.path, text, f.stat);
+        if (why === 'create' || why === 'scan-new') {
+          const t = this.parseTableText(f, text);
+          this.logOp({ type: 'ext-new', path: f.path, text: `外部新建了表格（${t.rows.length} 行，列：${t.headers.slice(0, 8).join('、')}${t.headers.length > 8 ? '…' : ''}）`, review: 'ok' });
+          this.scheduleIndex();
+        }
+        return;
+      }
+      if (old === text) { e.m = f.stat.mtime; e.s = f.stat.size; this.saveSnapIndex(); return; }
+      await this.handleExternal(f, old, text);
+    });
+  }
+
+  async handleExternal(f, oldText, newText) {
+    const oldT = this.parseTableText(f, oldText), newT = this.parseTableText(f, newText);
+    const d = diffTables(oldT, newT);
+    const nothing = !d.cells.length && !d.added.length && !d.removed.length && !d.addedCols.length && !d.removedCols.length && !d.renamed.length;
+    const meta = (this.settings.meta || {})[f.path];
+    let link = null, oldRows = null, oldCols = null;
+    if (meta && meta.link) {
+      link = await this.readLink(meta.link.id, meta.link.sheet);
+      if (link) {
+        oldRows = (link.map.rows || []).slice();
+        oldCols = link.map.cols ? link.map.cols.slice() : null;
+        link.map.rows = d.rowMap.map((i) => (i >= 0 && i < oldRows.length ? oldRows[i] : -1));
+        if (oldCols && oldCols.length === oldT.headers.length) link.map.cols = d.colMap.map((i) => (i >= 0 ? oldCols[i] : -1));
+        await this.writeLinkMap(link);
+      }
+    }
+    let hist = '';
+    if (!nothing) {
+      try {
+        const k = ((await this.snapIndex())[f.path] || {}).k || hashStr(f.path).slice(0, 12);
+        const dir = `${this.ataDir()}/history/${k}`;
+        await this.ensureAdapterDir(dir);
+        hist = `${dir}/${Date.now()}.json`;
+        await this.app.vault.adapter.write(hist, JSON.stringify({ path: f.path, text: oldText, rows: oldRows, cols: oldCols }));
+        const all = (await this.app.vault.adapter.list(dir)).files.sort();
+        for (const old of all.slice(0, Math.max(0, all.length - 40))) { try { await this.app.vault.adapter.remove(old); } catch (e) { /* 忽略 */ } }
+      } catch (e) { console.warn('[AI表格助手] 保存修改前版本失败', e); hist = ''; }
+    }
+    await this.snapPut(f.path, newText, f.stat);
+
+    /* 正在看的就是这张表：重新读进来，标出改动 */
+    if (this.file && this.file.path === f.path) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+      this.table = newT;
+      if (link) { this.link = link; this.attachProvenance(this.table, link.map); }
+      this.tableVersion = (this.tableVersion || 0) + 1;
+    }
+    if (nothing) { if (this.file && this.file.path === f.path && this.tab === 'workspace') this.renderTable(); return; }
+
+    const hdr = newT.headers.map(String);
+    const hl = { added: new Set(d.added), cells: new Map() };
+    d.cells.forEach((x) => { if (!hl.cells.has(x.r)) hl.cells.set(x.r, new Set()); hl.cells.get(x.r).add(x.c); });
+    d.addedCols.forEach((j) => newT.rows.forEach((r, ri) => { if (!isBlank(r[j]) && !hl.added.has(ri)) { if (!hl.cells.has(ri)) hl.cells.set(ri, new Set()); hl.cells.get(ri).add(j); } }));
+    if (!this.hlMap) this.hlMap = new Map();
+    this.hlMap.set(f.path, hl);
+
+    const parts = [];
+    if (d.added.length) parts.push(`新增 ${d.added.length} 行`);
+    if (d.cells.length) parts.push(`修改 ${d.cells.length} 个单元格`);
+    if (d.removed.length) parts.push(`删除 ${d.removed.length} 行`);
+    const items = [
+      ...d.renamed.map(([o, n]) => `列「${o}」改名为「${n}」`),
+      ...d.addedCols.map((j, k) => `新增列「${hdr[j]}」（${d.filled[k]} 行有内容）`),
+      ...d.removedCols.map((h) => `删除了列「${h}」`),
+    ];
+    if (!parts.length && items.length) parts.push(items[0]);
+    this.logOp({
+      type: 'ext', path: f.path, text: parts.join('，'), review: 'pending', hist, after: hashStr(newText),
+      cells: d.cells.slice(0, 300).map((x) => ({ r: x.r + 1, h: hdr[x.c], o: x.o, n: x.n })), cellsN: d.cells.length,
+      hdr, added: d.added.slice(0, 30).map((r) => newT.rows[r].map(cellStr)), addedN: d.added.length,
+      oldHdr: oldT.headers.map(String), rows: d.removed.slice(0, 30).map((r) => oldT.rows[r].map(cellStr)), rowsN: d.removed.length,
+      items,
+    });
+    this.scheduleIndex();
+    new Notice(`「${this.tableLabel(f.path)}」被外部修改：${parts.join('，')}。在工作台里可以查看、确认或撤销。`, 8000);
+    if (this.file && this.file.path === f.path && this.tab === 'workspace') { this.renderTable(); this.renderReview(); this.renderAiPanel(); }
+    else this.scheduleRender();
+  }
+
+  pendingFor(path) {
+    return (this.plugin.opLog || []).filter((e) => e.type === 'ext' && e.path === path && e.review === 'pending');
+  }
+
+  async confirmExternal(path) {
+    this.pendingFor(path).forEach((e) => { e.review = 'ok'; });
+    if (this.hlMap) this.hlMap.delete(path);
+    this.saveOpLog();
+    if (this.file && this.file.path === path && this.tab === 'workspace') { this.renderTable(); this.renderReview(); this.renderAiPanel(); }
+    else this.render();
+  }
+
+  async undoExternal(e) {
+    const f = this.app.vault.getAbstractFileByPath(e.path);
+    if (!(f instanceof TFile)) { new Notice('这张表已经不在了，没法撤销。'); return; }
+    if (!e.hist) { new Notice('没有保存修改前的版本，没法撤销。'); return; }
+    let h;
+    try { h = JSON.parse(await this.app.vault.adapter.read(e.hist)); } catch (err) { new Notice('找不到修改前的版本，没法撤销。'); return; }
+    const cur = await this.app.vault.read(f);
+    const go = async () => {
+      await this.flushSave();
+      await this.snapPut(f.path, h.text);
+      await this.app.vault.modify(f, h.text);
+      await this.snapPut(f.path, h.text, f.stat);
+      const meta = (this.settings.meta || {})[f.path];
+      let link = null;
+      if (meta && meta.link && h.rows) {
+        link = await this.readLink(meta.link.id, meta.link.sheet);
+        if (link) { link.map.rows = h.rows; if (h.cols) link.map.cols = h.cols; await this.writeLinkMap(link); }
+      }
+      (this.plugin.opLog || []).forEach((x) => { if (x.type === 'ext' && x.path === f.path && x.review === 'pending' && x.t >= e.t) x.review = 'undone'; });
+      e.review = 'undone';
+      if (this.hlMap) this.hlMap.delete(f.path);
+      this.logOp({ type: 'undo', path: f.path, text: `撤销了外部修改（${e.text}）` });
+      if (this.file && this.file.path === f.path) {
+        this.table = this.parseTableText(f, h.text);
+        if (link) { this.link = link; this.attachProvenance(this.table, link.map); }
+        this.tableVersion = (this.tableVersion || 0) + 1;
+      }
+      new Notice('已撤销这次外部修改，表格恢复到修改前。');
+      await this.render();
+    };
+    if (hashStr(cur) !== e.after) {
+      new ConfirmModal(this.app, '这张表之后又被改过', '撤销会把表格恢复到这次修改之前，之后的修改（包括你在工作台里的手动修改）也会一起退回。确定要撤销吗？', [{ text: '仍然撤销', warning: true, onClick: go }]).open();
+    } else await go();
+  }
+
+  /** 打开工作台时：把关掉期间别人改过的表找出来 */
+  async scanExternal() {
+    if (this.scanning) return;
+    this.scanning = true;
+    try {
+      const idx = await this.snapIndex();
+      const fresh = this.snapFresh;
+      const files = this.tableFiles();
+      const seen = new Set();
+      let n = 0;
+      for (const f of files) {
+        seen.add(f.path);
+        const e = idx[f.path];
+        if (e && e.m === f.stat.mtime && e.s === f.stat.size) continue;
+        await this.checkFile(f, e || fresh ? 'scan' : 'scan-new');
+        if (++n % 20 === 0) await new Promise((r) => setTimeout(r, 0));
+      }
+      for (const p of Object.keys(idx)) {
+        if (seen.has(p) || this.app.vault.getAbstractFileByPath(p)) continue;
+        this.logOp({ type: 'ext-del', path: p, name: idx[p].n, text: '表格文件被删除了（不是在工作台里删的）', review: 'ok' });
+        await this.snapDrop(p);
+      }
+      this.snapFresh = false;
+      this.saveSnapIndex();
+    } finally {
+      this.scanning = false;
+      this.snapReady = true;
+    }
+  }
+
+  onExtDelete(f) {
+    if (!this.snapIdx || !this.snapIdx[f.path]) return;
+    const name = this.snapIdx[f.path].n;
+    if (!this.selfDeleting) this.logOp({ type: 'ext-del', path: f.path, name, text: '表格文件被删除了（不是在工作台里删的）', review: 'ok' });
+    this.snapDrop(f.path);
+    this.scheduleIndex();
+  }
+
+  onExtRename(f, old) {
+    if (this.snapIdx && this.snapIdx[old]) {
+      this.snapIdx[f.path] = this.snapIdx[old];
+      delete this.snapIdx[old];
+      if (this.snapText && this.snapText.has(old)) { this.snapText.set(f.path, this.snapText.get(old)); this.snapText.delete(old); }
+      this.saveSnapIndex();
+    }
+    if (this.hlMap && this.hlMap.has(old)) { this.hlMap.set(f.path, this.hlMap.get(old)); this.hlMap.delete(old); }
+    (this.plugin.opLog || []).forEach((e) => { if (e.path === old) e.path = f.path; });
+    this.saveOpLog();
+    this.scheduleIndex();
+  }
+
+  /** 工作区表格上方的提示条：外部刚改过这张表 */
+  renderReview() {
+    const el = this.reviewEl;
+    if (!el || !this.file) return;
+    el.empty();
+    const pend = this.pendingFor(this.file.path);
+    el.toggleClass('is-hidden', !pend.length);
+    if (!pend.length) return;
+    const last = pend[pend.length - 1];
+    this.ico(el, 'bot', 'ata-review-icon');
+    const tx = el.createDiv('ata-review-text');
+    const tm = new Date(last.t);
+    tx.createEl('b', { text: `外部修改了这张表${pend.length > 1 ? `（${pend.length} 次）` : ''}` });
+    tx.createSpan({ text: ` · ${String(tm.getHours()).padStart(2, '0')}:${String(tm.getMinutes()).padStart(2, '0')} · ${last.text}。绿色是新增的行，黄色是改过的格子。` });
+    const bar = el.createDiv('ata-review-btns');
+    this.btn(bar, '查看明细', 'list', () => { this.tab = 'home'; this.opKind = '外部修改'; if (!this.opOpen) this.opOpen = new Set(); this.opOpen.add(last.t + '|' + last.type + '|' + (last.path || '')); this.render(); }, 'ata-btn-sm');
+    this.btn(bar, '撤销', 'undo-2', () => this.undoExternal(last), 'ata-btn-sm');
+    this.btn(bar, '确认', 'check', () => this.confirmExternal(this.file.path), 'ata-btn-sm mod-cta');
+  }
+
+  /* ================= 交给外部 AI ================= */
+  basePath() {
+    const a = this.app.vault.adapter;
+    return a && typeof a.getBasePath === 'function' ? a.getBasePath() : '';
+  }
+
+  absPath(p) {
+    const base = this.basePath();
+    if (!base) return p;
+    const sep = base.includes('\\') ? '\\' : '/';
+    return base.replace(/[\\/]+$/, '') + sep + p.split('/').join(sep);
+  }
+
+  guidePath() { return normalizePath(this.settings.folder + '/AI使用说明.md'); }
+
+  aiState(path) {
+    if (!this.aiStates) this.aiStates = new Map();
+    if (!this.aiStates.has(path)) this.aiStates.set(path, { ask: '', atts: [] });
+    return this.aiStates.get(path);
+  }
+
+  addAiAtts(path, tfs) {
+    const st = this.aiState(path);
+    tfs.forEach((tf) => { if (tf && !st.atts.includes(tf.path)) st.atts.push(tf.path); });
+  }
+
+  buildInstruction(file, st) {
+    const meta = (this.settings.meta || {})[file.path] || {};
+    const stat = this.stats.get(file.path);
+    const cols = stat ? stat.headers.slice(0, 30).join('、') : '';
+    const lines = [
+      '请帮我修改 Obsidian「表格工作台」里的一张表格，直接修改我电脑上的文件。',
+      '',
+      `1. 先阅读说明文件（里面有文件格式和修改规则）：${this.absPath(this.guidePath())}`,
+      `2. 要修改的表格：${this.absPath(file.path)}`,
+      `   （${meta.workbook ? `Excel「${meta.workbook}」里的工作表「${meta.sheet}」` : file.basename}${cols ? `；列：${cols}` : ''}${stat ? `；现在 ${stat.rows} 行` : ''}）`,
+    ];
+    const atts = st.atts.filter((p) => this.app.vault.getAbstractFileByPath(p));
+    if (atts.length) {
+      lines.push('3. 参考的附件：');
+      atts.forEach((p) => lines.push(`   - ${this.absPath(p)}`));
+    }
+    lines.push(`${atts.length ? 4 : 3}. 要求：${st.ask.trim() || '（请按上面的说明处理附件里的内容）'}`);
+    lines.push('', '改完后请简要告诉我新增、修改了哪些行。我会在 Obsidian 里查看改动，确认或撤销。');
+    return lines.join('\n');
+  }
+
+  async copyText(text, what) {
+    try { await navigator.clipboard.writeText(text); new Notice(`已复制${what || ''}，粘贴给你的 AI 就行。`); }
+    catch (e) {
+      try { require('electron').clipboard.writeText(text); new Notice(`已复制${what || ''}，粘贴给你的 AI 就行。`); }
+      catch (err) { new Notice('复制失败：' + (e.message || e)); }
+    }
+  }
+
+  /** 工作区右侧：把这张表交给外部 AI */
+  renderAiPanel() {
+    const el = this.aiPanelEl;
+    if (!el || !el.isConnected || !this.file) return;
+    el.empty();
+    const file = this.file;
+    const st = this.aiState(file.path);
+    const head = el.createDiv('ata-chat-head');
+    this.ico(head, 'bot');
+    head.createSpan({ text: '交给外部 AI' });
+
+    const body = el.createDiv('ata-aip');
+    /* 1. 待确认的外部修改 */
+    const pend = this.pendingFor(file.path);
+    if (pend.length) {
+      const box = body.createDiv('ata-aip-pending');
+      box.createDiv({ cls: 'ata-aip-label', text: `待确认的外部修改（${pend.length}）` });
+      pend.slice(-3).reverse().forEach((e) => {
+        const tm = new Date(e.t);
+        box.createDiv({ cls: 'ata-aip-pitem', text: `${String(tm.getHours()).padStart(2, '0')}:${String(tm.getMinutes()).padStart(2, '0')}  ${e.text}` });
+      });
+      const b = box.createDiv('ata-aip-row');
+      this.btn(b, '撤销最近一次', 'undo-2', () => this.undoExternal(pend[pend.length - 1]), 'ata-btn-sm');
+      this.btn(b, '全部确认', 'check', () => this.confirmExternal(file.path), 'ata-btn-sm mod-cta');
+    }
+
+    /* 2. 要 AI 做什么 */
+    body.createDiv({ cls: 'ata-aip-label', text: '要 AI 做什么' });
+    const chips = body.createDiv('ata-chips');
+    const ta = body.createEl('textarea', { cls: 'ata-aip-ask', attr: { rows: '5', placeholder: '用中文写要求，比如：把附件里的送货单录入这张表，金额 = 数量 × 单价' } });
+    ta.value = st.ask;
+    ta.addEventListener('input', () => { st.ask = ta.value; });
+    AI_TEMPLATES.forEach(([label, text]) => {
+      chips.createEl('button', { cls: 'ata-catchip', text: label }).addEventListener('click', () => { st.ask = ta.value = text; ta.focus(); });
+    });
+
+    /* 3. 附件 */
+    const ah = body.createDiv('ata-aip-label');
+    ah.createSpan({ text: '附件（单据、截图、价格表）' });
+    const atts = body.createDiv('ata-aip-atts');
+    st.atts = st.atts.filter((p) => this.app.vault.getAbstractFileByPath(p));
+    st.atts.forEach((p) => {
+      const tf = this.app.vault.getAbstractFileByPath(p);
+      const c = atts.createDiv('ata-aip-att');
+      const th = c.createDiv('ata-athumb');
+      this.renderThumb(th, tf);
+      th.addEventListener('click', () => new LightboxModal(this.app, this, tf).open());
+      c.createDiv({ cls: 'ata-aip-attname', text: tf.name, attr: { title: tf.path } });
+      const x = c.createEl('button', { cls: 'ata-aip-x', text: '×', attr: { 'aria-label': '移除' } });
+      x.addEventListener('click', () => { st.atts = st.atts.filter((q) => q !== p); this.renderAiPanel(); });
+    });
+    const ab = body.createDiv('ata-aip-row');
+    this.btn(ab, '上传 / 拖入文件', 'upload', () => { this.aiUploadFor = file.path; this.aiInput.click(); }, 'ata-btn-sm');
+    this.btn(ab, '从附件区选', 'archive', () => new ArchivePickModal(this.app, this, (tfs) => { this.addAiAtts(file.path, tfs); this.renderAiPanel(); }).open(), 'ata-btn-sm');
+
+    /* 4. 复制指令 */
+    const go = body.createDiv('ata-aip-go');
+    this.btn(go, '复制给 AI 的指令', 'clipboard-copy', () => this.copyText(this.buildInstruction(file, st), '指令'), 'mod-cta');
+    const more = body.createDiv('ata-aip-row');
+    this.btn(more, '只复制表格路径', 'link', () => this.copyText(this.absPath(file.path), '表格路径'), 'ata-btn-sm');
+    this.btn(more, '预览指令', 'eye', () => new TextPromptModal(this.app, '给 AI 的指令（可以复制）', this.buildInstruction(file, st), () => {}, true).open(), 'ata-btn-sm');
+
+    const tip = body.createDiv('ata-aip-tip');
+    tip.createDiv({ text: '把指令粘贴给能直接读写电脑文件的 AI（例如 Claude 桌面版连上这个文件夹、Claude Code、Codex 等），它会直接改这张表的文件。' });
+    tip.createDiv({ text: `AI 需要能访问的文件夹：${this.absPath(normalizePath(this.settings.folder))}` });
+    tip.createDiv({ text: '改动会自动出现在左边：绿色是新增，黄色是修改，可以确认或撤销。网页版聊天读不到你电脑上的文件。' });
+  }
+
+  /** 收到单据：先存进附件区，再选要填的表，打开后附件已经放好 */
+  async handoff(tfs, target) {
+    tfs = (tfs || []).filter(Boolean);
+    const go = async (file) => {
+      this.addAiAtts(file.path, tfs);
+      const st = this.aiState(file.path);
+      if (!st.ask.trim()) st.ask = AI_TEMPLATES[0][1];
+      await this.openTable(file);
+    };
+    if (target instanceof TFile) { await go(target); return; }
+    const files = this.recentFiles(200);
+    const all = this.tableFiles();
+    const rest = all.filter((f) => !files.includes(f));
+    new TablePickModal(this.app, [...files, ...rest], (f) => go(f), this.settings.meta, tfs.length ? `已存入附件区：${tfs.map((x) => x.name).join('、')}。选择要填的表…` : null).open();
+  }
+
+  /* ================= 给 AI 看的说明文件和表格目录 ================= */
+  async writeAiGuide() {
+    const folder = normalizePath(this.settings.folder);
+    await this.ensureFolder(folder);
+    const abs = this.absPath(folder);
+    const guide = `<!-- 由「AI 表格助手」插件自动生成，每次打开工作台都会更新，手动修改会被覆盖 -->
+# 表格工作台 · 给 AI 的使用说明
+
+你正在帮用户修改 Obsidian 里「表格工作台」管理的表格。表格就是这个文件夹里的普通文件，直接读写文件即可。用户会在 Obsidian 里看到你改了哪些地方（新增的行标绿色，改过的格子标黄色），并决定确认还是撤销。
+
+## 文件夹结构
+
+表格文件夹：\`${abs}\`
+
+- \`表格目录.md\`：所有表格的清单（文件路径、来源、列名、行数、一行样例）。**不知道该改哪张表时先看它。**
+- 各个 \`.csv\` 文件：表格本身。从多工作表 Excel 导入的表放在以 Excel 文件名命名的子文件夹里，每个工作表一个 csv。
+- \`附件区/年-月/\`：用户存的单据、截图、PDF、价格表等参考资料。
+- \`导出/\`：导出的 Excel，不要修改。
+- \`.ata/\`：插件内部数据（原 Excel 副本、格式对应关系、修改记录），**不要读写这个文件夹**。
+
+## 修改表格的规则
+
+1. **CSV 格式**：UTF-8 编码；第一行是表头；字段里有逗号、引号或换行时，用英文双引号包起来，内部的双引号写成两个 \`""\`。
+2. **不要改表头**（列名和列的顺序），除非用户明确要求。需要新列时加在最后。
+3. **新增的行加在表格末尾**，不要插到中间，也不要调整已有行的顺序；用户要求删除时才删除行。
+4. **只改需要改的行和格子**，其它内容保持原样（包括空格子、原来的写法）。
+5. **格式和原表保持一致**：日期写成 \`YYYY-MM-DD\`（或照搬这一列已有的写法）；数字不要加千分位逗号和货币符号；金额等计算列请自己算好再填。
+6. 从 Excel 导入的表，用户导出时会把你的修改按原 Excel 的颜色、公式、格式写回去，所以请保持行列结构，不要整体重写或重新排序。
+7. Markdown 笔记里的表格：只修改其中的表格部分，表格外的文字不要动。
+8. **不要删除、改名或移动表格文件。** 需要新表时，在表格文件夹里新建一个 csv 文件（第一行写表头）。
+9. 用户只让你「检查」或「列出」时，不要修改文件。
+
+## 改完以后
+
+在回复里简要说明：改了哪张表、新增了几行、改了哪些格子、有哪些拿不准需要用户核对的地方。
+`;
+    const ptr = `<!-- 由「AI 表格助手」插件自动生成 -->\n# 说明\n\n这个文件夹是 Obsidian「表格工作台」的表格库。修改任何表格之前，请先阅读同一文件夹里的 \`AI使用说明.md\`，并按其中的规则操作；要找表格请看 \`表格目录.md\`。\n`;
+    const put = async (name, text) => {
+      const p = `${folder}/${name}`;
+      const f = this.app.vault.getAbstractFileByPath(p);
+      try {
+        if (f instanceof TFile) { if ((await this.app.vault.read(f)) !== text) await this.app.vault.modify(f, text); }
+        else await this.app.vault.create(p, text);
+      } catch (e) { console.warn('[AI表格助手] 写说明文件失败', name, e); }
+    };
+    await put('AI使用说明.md', guide);
+    await put('CLAUDE.md', ptr);
+    await put('AGENTS.md', ptr);
+    await this.writeTableIndex();
+  }
+
+  scheduleIndex() {
+    clearTimeout(this.indexTimer);
+    this.indexTimer = setTimeout(() => this.writeTableIndex(), 4000);
+  }
+
+  async writeTableIndex() {
+    const folder = normalizePath(this.settings.folder);
+    const lib = await this.library();
+    const meta = this.settings.meta || {};
+    const lines = ['<!-- 由「AI 表格助手」插件自动生成，表格有变化时自动更新，手动修改会被覆盖 -->', '# 表格目录', '', `共 ${lib.length} 张表格。路径相对于 Obsidian 库：\`${this.basePath() || '（库文件夹）'}\``, ''];
+    const books = new Map();
+    lib.forEach((t) => {
+      const m = meta[t.file.path] || {};
+      const key = m.workbook ? '工作簿：' + m.workbook : '单独的表格';
+      if (!books.has(key)) books.set(key, []);
+      books.get(key).push(t);
+    });
+    for (const [key, list] of books) {
+      lines.push(`## ${key}`, '');
+      list.sort((a, b) => ((meta[a.file.path] || {}).sheetIndex || 0) - ((meta[b.file.path] || {}).sheetIndex || 0) || a.file.path.localeCompare(b.file.path));
+      for (const t of list) {
+        const m = meta[t.file.path] || {};
+        const d = new Date(t.mtime);
+        lines.push(`### ${m.sheet || t.file.basename}`);
+        lines.push(`- 文件：\`${t.file.path}\``);
+        if (m.category) lines.push(`- 分类：${m.category}`);
+        lines.push(`- 列（${t.headers.length}）：${t.headers.join('、')}`);
+        lines.push(`- 行数：${t.rows}，最后修改：${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`);
+        if (t.sample && t.sample.length) lines.push(`- 样例：${t.headers.map((h, i) => `${h}=${cellStr(t.sample[0][i])}`).filter((x) => !/=$/.test(x)).slice(0, 12).join('；')}`);
+        lines.push('');
+      }
+    }
+    const text = lines.join('\n');
+    const p = `${folder}/表格目录.md`;
+    const f = this.app.vault.getAbstractFileByPath(p);
+    try {
+      if (f instanceof TFile) { if ((await this.app.vault.read(f)).replace(/\r/g, '') !== text) await this.app.vault.modify(f, text); }
+      else { await this.ensureFolder(folder); await this.app.vault.create(p, text); }
+    } catch (e) { console.warn('[AI表格助手] 写表格目录失败', e); }
+  }
+
   /* ================= 操作记录 ================= */
   async loadOpLog() {
     const pl = this.plugin;
@@ -3438,34 +3367,15 @@ class TableWorkbenchView extends ItemView {
       last.t = e.t;
       last.text = `手动修改了 ${last.cells.length} 个单元格`;
       if (!last.cells.length) list.pop();
-    } else list.push(e);
+    } else {
+      if (e.type === 'edit' && !e.text) e.text = `手动修改了 ${(e.cells || []).length} 个单元格`;
+      list.push(e);
+    }
     if (list.length > 3000) list.splice(0, list.length - 3000);
     this.saveOpLog();
     if (this.tab === 'home' && !this.importRun) this.scheduleRender();
   }
 
-  /** 把 AI 的修改整理成记录 */
-  logAI(path, before, draft, track, changes, ask, atts) {
-    const cells = [];
-    for (const [r, cs] of track.cells) {
-      if (track.added.has(r)) continue;
-      for (const c of cs) {
-        if (cells.length >= 200) break;
-        cells.push({ r: r + 1, h: String(draft.headers[c]), o: before.rows[r] ? cellStr(before.rows[r][c]) : '', n: cellStr(draft.rows[r] && draft.rows[r][c]) });
-      }
-    }
-    const added = [...track.added].sort((a, b) => a - b);
-    const parts = [];
-    if (added.length) parts.push(`新增 ${added.length} 行`);
-    if (cells.length) parts.push(`修改 ${cells.length} 个单元格`);
-    if (track.structural && changes && changes.length) parts.push(...changes.filter((x) => !/新增|添加|修改了/.test(x)).slice(0, 3));
-    this.logOp({
-      type: 'ai', path, text: parts.join('，') || (changes || []).join('；') || 'AI 修改',
-      ask: ask ? String(ask).slice(0, 300) : '', atts: atts || [], cells,
-      hdr: draft.headers.map(String), added: added.slice(0, 30).map((r) => (draft.rows[r] || []).map(cellStr)), addedN: added.length,
-      notes: (changes || []).slice(0, 8),
-    });
-  }
 
   renderOpLog(body) {
     const sec = body.createDiv('ata-section ata-oplog');
@@ -3481,7 +3391,7 @@ class TableWorkbenchView extends ItemView {
       return;
     }
     const all = this.plugin.opLog;
-    const KINDS = [['全部', null], ['AI 修改', ['ai']], ['手动修改', ['edit', 'row', 'col', 'undo']], ['导入导出', ['import', 'export', 'create']], ['附件', ['archive']], ['删除', ['delete']]];
+    const KINDS = [['全部', null], ['外部修改', ['ext', 'ext-new', 'ext-del']], ['AI 修改（旧）', ['ai']], ['手动修改', ['edit', 'row', 'col', 'undo']], ['导入导出', ['import', 'export', 'create']], ['附件', ['archive']], ['删除', ['delete']]];
     const kindKey = this.opKind || '全部';
     const types = (KINDS.find((k) => k[0] === kindKey) || KINDS[0])[1];
     const chips = hr.createDiv('ata-catbar');
@@ -3506,10 +3416,10 @@ class TableWorkbenchView extends ItemView {
     const list = all.filter((e) => (!types || types.includes(e.type)) &&
       (!ql || [e.name, e.text, e.ask, ...(e.atts || [])].join(' ').toLowerCase().includes(ql) || (e.cells || []).some((c) => (c.o + ' ' + c.n).toLowerCase().includes(ql))));
     if (!list.length) {
-      box.createDiv({ cls: 'ata-empty-sm', text: all.length ? '没有符合条件的记录。' : '还没有操作记录。之后导入、AI 填表、手动修改、导出、删除都会记在这里，可以随时回来查改了什么。' });
+      box.createDiv({ cls: 'ata-empty-sm', text: all.length ? '没有符合条件的记录。' : '还没有操作记录。之后导入、外部 AI 的修改、手动修改、导出、删除都会记在这里，可以随时回来查改了什么。' });
       return;
     }
-    const TYPE = { ai: ['AI', 'sparkles'], edit: ['手动', 'pencil'], row: ['行', 'rows-3'], col: ['列', 'columns-3'], undo: ['撤销', 'undo-2'], import: ['导入', 'folder-down'], export: ['导出', 'download'], create: ['新建', 'file-plus'], delete: ['删除', 'trash-2'], archive: ['附件', 'archive'] };
+    const TYPE = { ext: ['外部修改', 'bot'], 'ext-new': ['外部新建', 'file-plus'], 'ext-del': ['外部删除', 'file-x'], ai: ['AI', 'sparkles'], edit: ['手动', 'pencil'], row: ['行', 'rows-3'], col: ['列', 'columns-3'], undo: ['撤销', 'undo-2'], import: ['导入', 'folder-down'], export: ['导出', 'download'], create: ['新建', 'file-plus'], delete: ['删除', 'trash-2'], archive: ['附件', 'archive'] };
     const show = this.opShow || 60;
     const items = list.slice(-show).reverse();
     const dayOf = (ts) => { const d = new Date(ts); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`; };
@@ -3539,6 +3449,19 @@ class TableWorkbenchView extends ItemView {
         else chip.title = '这张表已经不在了';
       }
       line.createSpan({ cls: 'ata-tl-text', text: e.text || '' });
+      if (e.type === 'ext' && e.review) {
+        line.createSpan({ cls: 'ata-tl-review r-' + e.review, text: { pending: '待确认', ok: '已确认', undone: '已撤销' }[e.review] || '' });
+        if (e.review === 'pending') {
+          const rb = main.createDiv('ata-tl-rbtns');
+          const latest = this.pendingFor(e.path).slice(-1)[0] === e;
+          const ok = rb.createEl('button', { cls: 'ata-tl-rbtn is-ok', text: '确认' });
+          ok.addEventListener('click', () => this.confirmExternal(e.path));
+          if (latest && e.hist) {
+            const un = rb.createEl('button', { cls: 'ata-tl-rbtn', text: '撤销这次修改' });
+            un.addEventListener('click', () => this.undoExternal(e));
+          }
+        }
+      }
       if (e.ask) main.createDiv({ cls: 'ata-tl-ask', text: '“' + e.ask + '”' + (e.atts && e.atts.length ? `  📎 ${e.atts.join('、')}` : '') });
       else if (e.atts && e.atts.length) main.createDiv({ cls: 'ata-tl-ask', text: '📎 ' + e.atts.join('、') });
       if (e.file) {
@@ -3548,7 +3471,7 @@ class TableWorkbenchView extends ItemView {
           a.addEventListener('click', () => (this.app.openWithDefaultApp ? this.app.openWithDefaultApp(ef.path) : this.app.workspace.getLeaf('tab').openFile(ef)));
         }
       }
-      const nCells = (e.cells || []).length, nAdd = (e.added || []).length, nRow = (e.rows || []).length;
+      const nCells = e.cellsN || (e.cells || []).length, nAdd = (e.added || []).length, nRow = e.rowsN || (e.rows || []).length;
       if (nCells || nAdd || nRow || (e.items && e.items.length)) {
         const key = e.t + '|' + e.type + '|' + (e.path || '');
         const open = this.opOpen.has(key);
@@ -3565,7 +3488,7 @@ class TableWorkbenchView extends ItemView {
 
   renderOpDetail(el, e) {
     if (e.cells && e.cells.length) {
-      el.createDiv({ cls: 'ata-tl-sub', text: `修改的单元格（${e.cells.length}）` });
+      el.createDiv({ cls: 'ata-tl-sub', text: `修改的单元格（${e.cellsN || e.cells.length}）` });
       const tb = el.createEl('table', { cls: 'ata-tl-tbl' });
       const hr = tb.createEl('tr');
       ['行', '列', '原来', '改成'].forEach((x) => hr.createEl('th', { text: x }));
@@ -3576,7 +3499,7 @@ class TableWorkbenchView extends ItemView {
         tr.createEl('td', { cls: 'is-old', text: c.o || '（空）' });
         tr.createEl('td', { cls: 'is-new', text: c.n || '（空）' });
       });
-      if (e.cells.length > 100) el.createDiv({ cls: 'ata-muted', text: `……共 ${e.cells.length} 个` });
+      if ((e.cellsN || e.cells.length) > 100) el.createDiv({ cls: 'ata-muted', text: `……共 ${e.cellsN || e.cells.length} 个` });
     }
     const rowsTable = (title, hdr, rows, more, cls) => {
       el.createDiv({ cls: 'ata-tl-sub', text: title });
@@ -3589,7 +3512,7 @@ class TableWorkbenchView extends ItemView {
       if (more > rows.length) el.createDiv({ cls: 'ata-muted', text: `……共 ${more} 行` });
     };
     if (e.added && e.added.length) rowsTable(`新增的行（${e.addedN || e.added.length}）`, e.hdr || [], e.added, e.addedN || 0, 'is-added');
-    if (e.rows && e.rows.length) rowsTable(`删除的行（${e.rows.length}）`, e.hdr || [], e.rows, e.rowsN || 0, 'is-removed');
+    if (e.rows && e.rows.length) rowsTable(`删除的行（${e.rowsN || e.rows.length}）`, e.oldHdr || e.hdr || [], e.rows, e.rowsN || 0, 'is-removed');
     if (e.items && e.items.length) {
       const ul = el.createEl('ul', { cls: 'ata-tl-list' });
       e.items.slice(0, 50).forEach((x) => ul.createEl('li', { text: x }));
@@ -3685,7 +3608,7 @@ class TableWorkbenchView extends ItemView {
     this.previewEl.onscroll = null;
     const t = this.table;
     if (!t.headers.length) {
-      this.previewEl.createDiv({ cls: 'ata-empty-sm ata-pad', text: '这是一个空表。可以直接告诉 AI 需要哪些列，或者发图片让它自动建表；也可以点下方「新增列」。' });
+      this.previewEl.createDiv({ cls: 'ata-empty-sm ata-pad', text: '这是一个空表。可以点下方「新增列」，或者在右边让外部 AI 按单据建好列。' });
       if (this.statEl) this.statEl.setText('');
       return;
     }
@@ -3743,10 +3666,13 @@ class TableWorkbenchView extends ItemView {
     tbody.appendChild(botPad);
     const vt = { start: -1, end: -1 };
 
+    const hl = this.hlMap && key ? this.hlMap.get(key) : null;
     const buildRow = (ri) => {
       const r = t.rows[ri];
       const tr = document.createElement('tr');
       tr.dataset.r = ri;
+      if (hl && hl.added.has(ri)) tr.className = 'is-ext-add';
+      const hlc = hl && hl.cells.get(ri);
       const num = document.createElement('td');
       num.className = 'ata-num';
       num.dataset.r = ri;
@@ -3769,6 +3695,7 @@ class TableWorkbenchView extends ItemView {
         td.dataset.r = ri;
         td.dataset.c = ci;
         if (sty) paint(td, r.__src, colSrc[ci]);
+        if (hlc && hlc.has(ci)) td.classList.add('is-ext-mod');
         tr.appendChild(td);
       }
       return tr;
@@ -3860,6 +3787,7 @@ class TableWorkbenchView extends ItemView {
       this.pushUndo();
       this.logOp({ type: 'row', path: this.file.path, text: `删除了第 ${ri + 1} 行`, hdr: t.headers.map(String), rows: [(t.rows[ri] || []).map(cellStr)] });
       t.rows.splice(ri, 1);
+      if (this.hlMap) this.hlMap.delete(this.file.path);
       await this.saveTable();
       this.renderTable();
       if (this.undoBtn) this.undoBtn.disabled = false;
@@ -3937,318 +3865,16 @@ class TableWorkbenchView extends ItemView {
     }).open();
   }
 
-  /* ---------- 对话 ---------- */
-  chatLog() {
-    const k = this.file ? this.file.path : '';
-    if (!this.chatLogs.has(k)) this.chatLogs.set(k, []);
-    return this.chatLogs.get(k);
-  }
 
-  renderChatLog() {
-    if (!this.chatEl) return;
-    this.chatEl.empty();
-    const log = this.chatLog();
-    if (!log.length) {
-      const hello = this.chatEl.createDiv('ata-msg ata-assistant');
-      hello.createDiv({ cls: 'ata-text', text: '我可以帮你：\n• 给每一行分类、排序、增删改\n• 识别图片（票据、截图、名片…）并录入\n• 把附件表格的信息合并进来\n• 检查数据问题\n\n修改会直接保存到文件，可随时撤销。' });
-    }
-    log.forEach((m) => this.drawMsg(m));
-  }
 
-  drawMsg(m, replaceEl) {
-    const el = createDiv('ata-msg ata-' + m.role);
-    if (replaceEl) replaceEl.replaceWith(el); else this.chatEl.appendChild(el);
-    const textEl = el.createDiv({ cls: 'ata-text' });
-    if ((m.role === 'assistant' || m.role === 'error') && MarkdownRenderer) {
-      textEl.addClass('ata-md');
-      const md = String(m.text || '').replace(/^\s*[•·]\s?/gm, '- ');
-      try {
-        const r = MarkdownRenderer.render ? MarkdownRenderer.render(this.app, md, textEl, (this.file && this.file.path) || '', this)
-          : MarkdownRenderer.renderMarkdown(md, textEl, (this.file && this.file.path) || '', this);
-        if (r && r.catch) r.catch(() => textEl.setText(m.text));
-      } catch (e) { textEl.setText(m.text); }
-    } else textEl.setText(m.text);
-    if (m.atts && m.atts.length) {
-      const strip = el.createDiv('ata-attach');
-      m.atts.forEach((a) => {
-        const item = strip.createDiv('ata-att');
-        if (a.dataUrl) item.createEl('img', { attr: { src: a.dataUrl } });
-        else item.createSpan({ text: (a.kind === 'pdf' ? '📄 ' : '▦ ') + a.name });
-      });
-    }
-    if (m.changes && m.changes.length) {
-      const ul = el.createEl('ul', { cls: 'ata-changes' });
-      m.changes.forEach((c) => ul.createEl('li', { text: c }));
-    }
-    if (m.preview) this.renderPreview(el, m);
-    if (!replaceEl) this.chatEl.scrollTop = this.chatEl.scrollHeight;
-    return el;
-  }
 
-  renderPreview(el, m) {
-    el.addClass('ata-msg-wide');
-    const p = m.preview;
-    const box = el.createDiv('ata-pv');
-    if (m.done) {
-      box.createDiv({ cls: 'ata-pv-done', text: m.done === 'applied' ? '✓ 已应用到表格' : m.done === 'stale' ? '表格在这期间被改过，这次修改已作废，请重新发送' : '已放弃这次修改' });
-      return;
-    }
-    const { draft, track, before } = p;
-    const rows = [...new Set([...track.cells.keys(), ...track.added])].sort((a, b) => a - b);
-    if (track.structural) {
-      box.createDiv({ cls: 'ata-muted', text: '这次修改包含排序 / 删除 / 重建，应用后可在左侧表格查看，不满意可以撤销。' });
-    } else if (rows.length) {
-      const colSet = new Set([0, 1].filter((c) => c < draft.headers.length));
-      track.cells.forEach((set) => set.forEach((c) => colSet.add(c)));
-      track.added.forEach((r) => draft.rows[r].forEach((v, c) => { if (!isBlank(v)) colSet.add(c); }));
-      const cols = [...colSet].sort((a, b) => a - b).slice(0, 10);
-      const wrap = box.createDiv('ata-pv-wrap');
-      const tb = wrap.createEl('table', { cls: 'ata-pv-table' });
-      const hr = tb.createEl('tr');
-      hr.createEl('th', { text: '' });
-      cols.forEach((c) => hr.createEl('th', { text: draft.headers[c] }));
-      rows.slice(0, 40).forEach((r) => {
-        const isNew = track.added.has(r);
-        const tr = tb.createEl('tr', { cls: isNew ? 'is-added' : '' });
-        tr.createEl('td', { cls: 'ata-pv-tag', text: isNew ? '新增' : `第 ${r + 1} 行` });
-        const changed = track.cells.get(r) || new Set();
-        cols.forEach((c) => {
-          const v = cellStr(draft.rows[r][c]);
-          const td = tr.createEl('td', { text: v });
-          if (!isNew && changed.has(c)) {
-            td.addClass('is-changed');
-            const old = before.rows[r] ? cellStr(before.rows[r][c]) : '';
-            td.title = `原来：${old || '（空）'}`;
-            if (old) td.createDiv({ cls: 'ata-pv-old', text: old });
-          }
-        });
-      });
-      if (rows.length > 40) box.createDiv({ cls: 'ata-muted', text: `……还有 ${rows.length - 40} 行，应用后在表格里查看。` });
-      box.createDiv({ cls: 'ata-muted', text: '黄色 = 修改（灰色小字是原值），绿色 = 新增。' });
-    }
-    const bar = box.createDiv('ata-pv-bar');
-    this.btn(bar, '应用修改', 'check', () => this.applyPreview(m, el), 'mod-cta ata-btn-sm');
-    this.btn(bar, '放弃', 'x', () => { m.done = 'discarded'; m.preview = Object.assign({}, m.preview, { draft: null }); this.drawMsg(m, el); }, 'ata-btn-sm');
-  }
 
-  async applyPreview(m, el) {
-    const p = m.preview;
-    if (!this.file || this.file.path !== p.path || this.tableVersion !== p.version) {
-      m.done = 'stale';
-      this.drawMsg(m, el);
-      return;
-    }
-    this.pushUndo();
-    this.logAI(p.path, p.before, p.draft, p.track, m.changes, p.ask, p.atts);
-    this.table = p.draft;
-    await this.saveTable();
-    this.showRows = Math.max(this.showRows || 0, Math.min(this.table.rows.length, (this.showRows || 0) + p.track.added.size));
-    this.renderTable();
-    if (this.undoBtn) this.undoBtn.disabled = false;
-    m.done = 'applied';
-    this.drawMsg(m, el);
-    if (p.track.added.size && this.previewEl) { this.previewEl.scrollTop = this.previewEl.scrollHeight; if (this.redrawRows) this.redrawRows(); }
-  }
 
-  addMsg(role, text, extra) {
-    const m = Object.assign({ role, text }, extra || {});
-    this.chatLog().push(m);
-    if (this.chatEl && this.tab === 'workspace') {
-      const hello = this.chatEl.querySelector('.ata-msg.ata-assistant:only-child');
-      if (hello && this.chatLog().length === 1) hello.remove();
-      return this.drawMsg(m);
-    }
-    return null;
-  }
 
-  renderAttachments() {
-    if (!this.attachEl) return;
-    this.attachEl.empty();
-    this.attachments.forEach((a, i) => {
-      const item = this.attachEl.createDiv('ata-att');
-      if (a.kind === 'image') item.createEl('img', { attr: { src: a.dataUrl } });
-      else if (a.kind === 'pdf') item.createSpan({ text: '📄 ' + a.name });
-      else item.createSpan({ text: `▦ ${a.name}（${a.table.rows.length} 行）` });
-      const x = item.createEl('button', { text: '×', cls: 'ata-att-x', attr: { 'aria-label': '移除' } });
-      x.addEventListener('click', () => { this.attachments.splice(i, 1); this.renderAttachments(); });
-    });
-  }
 
-  async addAttachments(files) {
-    const notice = files.length > 1 || files.some((f) => f.size > 5e6) ? new Notice('正在读取附件…', 0) : null;
-    for (const f of files) {
-      try {
-        const before = this.attachments.length;
-        if (isImageFile(f)) this.attachments.push(await imageToPayload(f));
-        else if (isPdfFile(f)) this.attachments.push(await pdfToPayload(f));
-        else if (TABLE_EXT.test(f.name)) {
-          let sheets = await fileToSheets(f);
-          if (sheets.length > 1) {
-            if (notice) notice.hide();
-            sheets = await new Promise((res) => {
-              const m = new SheetPickModal(this.app, f.name, sheets, res);
-              const close = m.onClose.bind(m);
-              m.onClose = () => { close(); res(null); };
-              m.open();
-            }) || [];
-          }
-          sheets.forEach((sh) => this.attachments.push({ kind: 'table', name: sh.name ? `${f.name}·${sh.name}` : f.name, table: sh.table, title: sh.title }));
-        } else new Notice(`「${f.name}」不是图片、PDF 或表格，已跳过。`);
-        /* 记住原文件：发送后自动存进附件区，或者记下是从附件区哪个文件来的 */
-        for (let k = before; k < this.attachments.length; k++) {
-          Object.defineProperty(this.attachments[k], '_file', { value: f, enumerable: false });
-          if (f.__archivePath) Object.defineProperty(this.attachments[k], '_src', { value: f.__archivePath, enumerable: false });
-        }
-      } catch (e) {
-        new Notice(e.message, 8000);
-      }
-    }
-    if (notice) notice.hide();
-    if (this.tab !== 'workspace' || this.renderedTab !== 'workspace') { this.tab = 'workspace'; await this.render(); }
-    else {
-      this.renderAttachments();
-      if (this.pendingPrompt && this.inputEl && !this.inputEl.value.trim()) { this.inputEl.value = this.pendingPrompt; this.inputEl.focus(); }
-      this.pendingPrompt = null;
-    }
-  }
 
-  async send() {
-    if (this.busy) return;
-    const text = this.inputEl.value.trim();
-    const atts = this.attachments;
-    if (!text && !atts.length) return;
-    if (!this.file) { new Notice('请先打开一个表格。'); return; }
-    await this.flushSave();
-    const file = this.file;
 
-    const files = atts.filter((a) => a.kind === 'image' || a.kind === 'pdf');
-    const tables = atts.filter((a) => a.kind === 'table');
-    const ask = text || (tables.length || files.length ? MASTER_PROMPT : '');
 
-    this.addMsg('user', ask, { atts: atts.map((a) => ({ name: a.name, kind: a.kind, dataUrl: a.dataUrl })) });
-    this.inputEl.value = '';
-    this.attachments = [];
-    this.renderAttachments();
-
-    const max = Math.max(1, +this.settings.maxRows || 300);
-    const d = new Date(), z = (n) => String(n).padStart(2, '0');
-    const meta = (this.settings.meta || {})[file.path];
-    let prompt = `今天是 ${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}。\n\n【目标表格：${file.name}${(this.settings.meta || {})[file.path] && this.settings.meta[file.path].sheet ? `（Excel「${this.settings.meta[file.path].workbook}」的工作表「${this.settings.meta[file.path].sheet}」）` : ''}】${meta && meta.title ? `\n表格标题 / 说明：${meta.title}` : ''}\n${tableToPrompt(this.table, max)}\n`;
-    tables.forEach((a) => {
-      const n = a.table.rows.length;
-      const show = n <= 60 ? n : 20;
-      prompt += `\n【附件表格：${a.name}】共 ${n} 行${a.title ? `，标题：${a.title}` : ''}${show < n ? `；这里只给出前 ${show} 行，请用 merge_attachment 让插件处理全部行` : ''}\n${tableToPrompt(a.table, show)}\n`;
-    });
-    files.forEach((f) => { prompt += `\n【附件${f.kind === 'pdf' ? ' PDF' : '图片'}：${f.name}】（见上方内容）`; });
-    prompt += `\n\n【用户要求】\n${ask}`;
-
-    this.busy = true;
-    if (this.sendBtn) this.sendBtn.disabled = true;
-    const waiting = this.chatEl && this.chatEl.createDiv({ cls: 'ata-msg ata-assistant ata-wait', text: files.length ? '正在识别附件…' : '思考中…' });
-    if (this.chatEl) this.chatEl.scrollTop = this.chatEl.scrollHeight;
-    const history = this.histories.get(file.path) || [];
-    try {
-      const raw = await callAI(this.settings, history.slice(-6), prompt, files);
-      if (waiting) waiting.remove();
-      const parsed = extractJSON(raw);
-      if (!this.file || this.file.path !== file.path) throw new Error('回复到达前已切换了表格，本次修改没有应用。');
-      if (!parsed) {
-        const said = salvageReply(raw);
-        if (!said && raw && String(raw).indexOf('{') < 0) this.addMsg('assistant', String(raw).trim() + '\n\n> 这次没有修改表格。');
-        else this.addMsg('assistant', said
-          ? said + '\n\n> ⚠ AI 返回的格式不完整，**这次没有修改表格**。可以再发一次，或者让它「按 JSON 格式重新输出修改」。'
-          : '⚠ AI 返回的内容无法识别，**这次没有修改表格**。原始回复：\n\n' + String(raw || '（空）').slice(0, 2000), { raw: true });
-      } else {
-        const attMap = {};
-        tables.forEach((a) => { attMap[a.name] = a.table; });
-        let changes = [];
-        if (Array.isArray(parsed.actions) && parsed.actions.length) {
-          const draft = cloneTable(this.table);
-          const track = newTrack();
-          changes = applyActions(draft, parsed.actions, { attachments: attMap, track });
-          const real = track.structural || track.added.size || track.cells.size;
-          if (parsed.__truncated) parsed.reply = (parsed.reply || '') + '\n\n> ⚠ AI 的回复被截断了，**最后一条记录可能不完整**，请在下面的预览里核对后再应用。';
-          if (real && (this.settings.preview || parsed.__truncated)) {
-            this.addMsg('assistant', parsed.reply || '请确认下面的修改：', {
-              changes,
-              preview: { draft, track, before: this.table, path: file.path, version: this.tableVersion, ask: text, atts: atts.map((a) => a.name) },
-            });
-          } else if (real) {
-            this.pushUndo();
-            this.logAI(file.path, this.table, draft, track, changes, text, atts.map((a) => a.name));
-            this.table = draft;
-            await this.saveTable();
-            this.renderTable();
-            if (this.undoBtn) this.undoBtn.disabled = false;
-            this.addMsg('assistant', parsed.reply || '已完成。', { changes });
-          } else {
-            this.addMsg('assistant', parsed.reply || '（没有需要修改的地方）', { changes });
-          }
-        } else {
-          this.addMsg('assistant', parsed.reply || '（没有修改）');
-        }
-      }
-      this.archiveAfterSend(atts, file).catch((e) => console.warn('[AI表格助手] 存档附件失败', e));
-      const attNote = atts.length ? `\n（附带 ${atts.length} 个附件：${atts.map((a) => a.name).join('、')}）` : '';
-      history.push({ role: 'user', content: ask + attNote });
-      history.push({ role: 'assistant', content: raw || '{"reply":"","actions":[]}' });
-      this.histories.set(file.path, history);
-    } catch (e) {
-      if (waiting) waiting.remove();
-      this.addMsg('error', e.message || String(e));
-    } finally {
-      this.busy = false;
-      if (this.sendBtn) this.sendBtn.disabled = false;
-    }
-  }
-
-  /* ---------- AI 归类表格文件 ---------- */
-  classifyDialog() {
-    const lib = this.lib || [];
-    if (!lib.length) { new Notice('表格库是空的，先导入一些表格。'); return; }
-    const uncat = lib.filter((t) => !t.category).length;
-    new ClassifyModal(this.app, lib.length, uncat, (scope, cats) => this.classify(scope, cats)).open();
-  }
-
-  async classify(scope, cats) {
-    const lib = (this.lib || []).filter((t) => scope === 'all' || !t.category);
-    if (!lib.length) { new Notice('没有需要归类的表格。'); return; }
-    const notice = new Notice(`AI 正在归类 ${lib.length} 个表格…`, 0);
-    try {
-      const BATCH = 40;
-      let done = 0;
-      const existing = [...new Set((this.lib || []).map((t) => t.category).filter(Boolean))];
-      for (let i = 0; i < lib.length; i += BATCH) {
-        const part = lib.slice(i, i + BATCH);
-        let prompt = cats.length ? `【指定类别】${cats.join('、')}\n\n` : existing.length ? `【已有类别，可沿用】${existing.join('、')}\n\n` : '';
-        prompt += '【表格列表】\n';
-        part.forEach((t, k) => {
-          prompt += `\n${k + 1}. 路径：${t.file.path}\n   列名：${t.headers.join('、') || '（空表）'}\n`;
-          t.sample.forEach((r) => { prompt += '   样例：' + r.map((c) => String(c).slice(0, 30)).join(' | ') + '\n'; });
-        });
-        const raw = await callAI(this.settings, [], prompt, [], CLASSIFY_PROMPT);
-        const parsed = extractJSON(raw);
-        if (!parsed || !Array.isArray(parsed.categories)) throw new Error('AI 返回的格式不对：' + String(raw).slice(0, 200));
-        const paths = new Set(part.map((t) => t.file.path));
-        for (const c of parsed.categories) {
-          if (c && paths.has(c.path) && c.category) {
-            await this.setCategory(c.path, String(c.category).trim());
-            done++;
-            if (!existing.includes(c.category)) existing.push(c.category);
-          }
-        }
-        notice.setMessage(`AI 正在归类… ${Math.min(i + BATCH, lib.length)} / ${lib.length}`);
-      }
-      notice.hide();
-      new Notice(`归类完成：${done} 个表格已打上分类。`);
-      this.libFilter = '全部';
-      this.tab = 'library';
-      await this.render();
-    } catch (e) {
-      notice.hide();
-      new Notice('归类失败：' + (e.message || e), 10000);
-    }
-  }
 
   /* ---------- 文件读写 ---------- */
   async ensureFolder(path) {
@@ -4281,7 +3907,7 @@ class TableWorkbenchView extends ItemView {
       if (file.extension === 'md') {
         const f = findMdTable(text);
         this.table = f ? f.table : { headers: [], rows: [] };
-        if (!f && !opts.silent) new Notice('这篇笔记里还没有表格，AI 写入时会追加到文末。');
+        if (!f && !opts.silent) new Notice('这篇笔记里还没有表格。');
       } else {
         this.table = gridToTable(parseCSV(text));
       }
@@ -4291,12 +3917,9 @@ class TableWorkbenchView extends ItemView {
       if (!this.file || this.file.path !== file.path) {
         if (this.file) {
           this.undoMap.set(this.file.path, this.undoStack);
-          this.attachMap.set(this.file.path, this.attachments);
           if (this.undoMap.size > 8) this.undoMap.delete(this.undoMap.keys().next().value);
         }
         this.undoStack = this.undoMap.get(file.path) || [];
-        this.attachments = this.attachMap.get(file.path) || [];
-        this.attachMap.delete(file.path);
         this.showRows = 0;
       }
       const rec = (this.settings.recent || []).filter((p) => p !== file.path);
@@ -4332,9 +3955,12 @@ class TableWorkbenchView extends ItemView {
         } else {
           out = text.replace(/\s*$/, '') + (text.trim() ? '\n\n' : '') + md + '\n';
         }
+        await this.snapPut(this.file.path, out);
         await this.app.vault.modify(this.file, out);
       } else {
-        await this.app.vault.modify(this.file, toCSV(this.table));
+        const csv = toCSV(this.table);
+        await this.snapPut(this.file.path, csv);
+        await this.app.vault.modify(this.file, csv);
         if (this.link) {
           this.link.map.rows = this.table.rows.map((r) => (r.__src == null ? -1 : r.__src));
           if (this.table.colSrc && this.table.colSrc.length === this.table.headers.length) this.link.map.cols = this.table.colSrc.slice();
@@ -4349,32 +3975,15 @@ class TableWorkbenchView extends ItemView {
   async handleDrop(list, zone) {
     if (!list.length) return;
     if (zone === 'archive' || this.tab === 'archive') { await this.archiveSave(list.map((x) => x.file).filter((f) => f.size > 0), '拖入'); return; }
-    const docs = list.filter((x) => isImageFile(x.file) || isPdfFile(x.file));
-    const tables = list.filter((x) => TABLE_EXT.test(x.file.name));
     const isFolder = list.some((x) => x.rel.includes('/'));
+    if (zone === 'import' || isFolder) { await this.importBatch(list); return; }
     if (zone && zone.startsWith('table:')) {
       const f = this.app.vault.getAbstractFileByPath(zone.slice(6));
-      if (f instanceof TFile) { await this.fillTable(f, list); return; }
+      if (f instanceof TFile) { await this.receiveAtts(list, f); return; }
     }
-    if (zone === 'chat' && this.file) { await this.addAttachments([...docs, ...tables].map((x) => x.file)); return; }
-    if (zone === 'import' || isFolder) { await this.importBatch(list); return; }
-    if (!docs.length && !tables.length) { new Notice('没有可以处理的表格、图片或 PDF。'); return; }
-    if (this.tab === 'workspace' && this.file && zone !== 'inbox' && !tables.length) {
-      await this.addAttachments(docs.map((x) => x.file));
-      return;
-    }
-    new RouteModal(this.app, this, list).open();
-  }
-
-  /** 打开某张表，把资料作为附件放进去，并填好默认指令 */
-  async fillTable(file, list) {
-    if (!(file instanceof TFile)) return;
-    const files = (list || []).map((x) => x.file || x).filter((f) => TABLE_EXT.test(f.name) || isImageFile(f) || isPdfFile(f));
-    if (!this.file || this.file.path !== file.path) await this.loadFile(file);
-    this.pendingPrompt = MASTER_PROMPT;
-    this.tab = 'workspace';
-    this.renderedTab = null;
-    await this.addAttachments(files);
+    if (zone === 'ai' && this.file) { await this.receiveAtts(list, this.file); return; }
+    if (zone === 'inbox') { await this.receiveAtts(list, null); return; }
+    await this.receive(list);
   }
 
   /** 删除表格文件（进回收站），并清理分类、常用、最近等记录 */
@@ -4383,6 +3992,8 @@ class TableWorkbenchView extends ItemView {
     if (!files.length) return;
     const names = files.map((f) => this.tableLabel(f.path));
     this.logOp({ type: 'delete', text: files.length === 1 ? `删除了表格「${names[0]}」（在回收站）` : `删除了 ${files.length} 个表格（在回收站）`, items: names });
+    this.selfDeleting = (this.selfDeleting || 0) + 1;
+    setTimeout(() => { this.selfDeleting = Math.max(0, (this.selfDeleting || 1) - 1); }, 4000 + files.length * 50);
     const folders = new Set();
     let n = 0;
     for (const f of files) {
@@ -4393,7 +4004,6 @@ class TableWorkbenchView extends ItemView {
           this.file = null;
           this.table = { headers: [], rows: [] };
           this.undoStack = [];
-          this.attachments = [];
         }
         if (f.parent && f.parent.path && f.parent.path !== '/') folders.add(f.parent);
         if (this.app.fileManager && this.app.fileManager.trashFile) await this.app.fileManager.trashFile(f);
@@ -4405,9 +4015,7 @@ class TableWorkbenchView extends ItemView {
         if (st.lastTable === f.path) st.lastTable = '';
         if (st.master === f.path) st.master = '';
         this.undoMap.delete(f.path);
-        this.attachMap.delete(f.path);
-        this.chatLogs.delete(f.path);
-        this.histories.delete(f.path);
+        if (this.aiStates) this.aiStates.delete(f.path);
         this.stats.delete(f.path);
         if (this.selected) this.selected.delete(f.path);
         n++;
@@ -4506,43 +4114,8 @@ class TableWorkbenchView extends ItemView {
     return saved;
   }
 
-  async archiveToFile(tf) {
-    const ext = (tf.extension || '').toLowerCase();
-    const f = new File([await this.app.vault.readBinary(tf)], tf.name, { type: MIME[ext] || '', lastModified: tf.stat.mtime });
-    Object.defineProperty(f, '__archivePath', { value: tf.path });
-    return f;
-  }
 
-  /** 从附件区送去提取：route = 推荐要填的表；current = 加到当前表 */
-  async archiveExtract(tfs, mode) {
-    const usable = tfs.filter((tf) => ['image', 'pdf', 'table'].includes(archiveKind(tf)));
-    if (!usable.length) { new Notice('只有图片、PDF 和表格文件可以让 AI 提取内容。'); return; }
-    if (usable.length < tfs.length) new Notice(`${tfs.length - usable.length} 个文件不是图片 / PDF / 表格，已跳过。`);
-    const files = [];
-    for (const tf of usable) files.push(await this.archiveToFile(tf));
-    const list = files.map((f) => ({ file: f, rel: f.name }));
-    if (mode === 'current' && this.file) await this.fillTable(this.file, list);
-    else new RouteModal(this.app, this, list).open();
-  }
 
-  /** 发送成功后：自动存档新附件、记下附件被提取到了哪张表 */
-  async archiveAfterSend(atts, file) {
-    const meta = this.settings.archiveMeta || (this.settings.archiveMeta = {});
-    const seen = new Set();
-    for (const a of atts) {
-      let src = a._src;
-      if (!src && a._file && this.settings.autoArchive !== false && !seen.has(a._file)) {
-        const saved = await this.archiveSave([a._file], '发送给 AI', true);
-        if (saved[0]) { src = saved[0].path; Object.defineProperty(a._file, '__archivePath', { value: src, configurable: true }); }
-      }
-      seen.add(a._file);
-      if (src && meta[src]) {
-        const used = meta[src].used || (meta[src].used = []);
-        if (!used.includes(file.path)) used.push(file.path);
-      }
-    }
-    await this.plugin.saveSettings();
-  }
 
   /** 缩略图：图片直接显示，PDF 渲染第一页（看得到的时候才渲染），其它显示图标 */
   renderThumb(box, tf) {
@@ -4584,7 +4157,7 @@ class TableWorkbenchView extends ItemView {
     const title = left.createDiv('ata-title');
     this.ico(title, 'archive');
     title.createSpan({ text: '附件区' });
-    left.createDiv({ cls: 'ata-sub', text: `${all.length} 个文件 · 共 ${fmtSize(all.reduce((a, f) => a + f.stat.size, 0))} · 收到的单据、截图、PDF、Excel 都可以先存在这里，要用时点「送去提取」` });
+    left.createDiv({ cls: 'ata-sub', text: `${all.length} 个文件 · 共 ${fmtSize(all.reduce((a, f) => a + f.stat.size, 0))} · 收到的单据、截图、PDF、Excel 都可以先存在这里，要用时点「交给 AI」` });
     const right = head.createDiv('ata-header-right');
     this.btn(right, this.archSelect ? '完成' : '批量管理', this.archSelect ? 'check' : 'list-checks', () => { this.archSelect = !this.archSelect; this.archSel.clear(); this.render(); });
     if (this.app.showInFolder) this.btn(right, '打开文件夹', 'folder-open', async () => { await this.ensureFolder(this.archiveDir()); this.app.showInFolder(this.archiveDir()); });
@@ -4594,7 +4167,7 @@ class TableWorkbenchView extends ItemView {
     this.ico(dz, 'archive', 'ata-dropzone-icon');
     const txt = dz.createDiv('ata-dropzone-text');
     txt.createEl('b', { text: '把文件拖到这里存档（任何类型都可以）' });
-    txt.createSpan({ text: `也可以点这里选择文件，或在本页按 Ctrl+V 粘贴复制的文件 / 截图 / 文件路径。保存在「${this.archiveDir()}」，按月份分文件夹。${this.settings.autoArchive !== false ? '发给 AI 的附件也会自动存一份。' : ''}` });
+    txt.createSpan({ text: `也可以点这里选择文件，或在本页按 Ctrl+V 粘贴复制的文件 / 截图 / 文件路径。保存在「${this.archiveDir()}」，按月份分文件夹。外部 AI 可以直接读这些文件。` });
     dz.addEventListener('click', () => this.archiveInput.click());
 
     if (!all.length) return;
@@ -4626,8 +4199,8 @@ class TableWorkbenchView extends ItemView {
       this.archCountEl = cnt;
       const sel = () => all.filter((f) => this.archSel.has(f.path));
       this.btn(sb, '全选', 'check-square', () => { list.forEach((f) => this.archSel.add(f.path)); this.render(); }, 'ata-btn-sm');
-      this.btn(sb, '送去提取', 'wand-2', () => { const s = sel(); if (s.length) this.archiveExtract(s, 'route'); }, 'ata-btn-sm mod-cta');
-      if (this.file) this.btn(sb, '加到当前表', 'paperclip', () => { const s = sel(); if (s.length) this.archiveExtract(s, 'current'); }, 'ata-btn-sm');
+      this.btn(sb, '交给 AI 填表', 'bot', () => { const s = sel(); if (s.length) this.handoff(s); }, 'ata-btn-sm mod-cta');
+      if (this.file) this.btn(sb, '加到当前表的附件', 'paperclip', () => { const s = sel(); if (s.length) { this.addAiAtts(this.file.path, s); this.openTable(this.file); } }, 'ata-btn-sm');
       this.btn(sb, '删除所选', 'trash-2', () => {
         const s = sel();
         if (!s.length) return;
@@ -4668,14 +4241,11 @@ class TableWorkbenchView extends ItemView {
         }).open();
       });
       const acts = c.createDiv('ata-aacts');
-      const usable = ['image', 'pdf', 'table'].includes(archiveKind(f));
-      if (usable) {
-        const go = acts.createEl('button', { cls: 'ata-abtn is-cta', text: '送去提取' });
-        go.addEventListener('click', (e) => { e.stopPropagation(); this.archiveExtract([f], 'route'); });
-        if (this.file) {
-          const cur = acts.createEl('button', { cls: 'ata-abtn', text: '加到当前表', attr: { title: '作为附件加到「' + this.file.basename + '」' } });
-          cur.addEventListener('click', (e) => { e.stopPropagation(); this.archiveExtract([f], 'current'); });
-        }
+      const go = acts.createEl('button', { cls: 'ata-abtn is-cta', text: '交给 AI', attr: { title: '选一张表，把这个文件作为附件，复制指令给外部 AI' } });
+      go.addEventListener('click', (e) => { e.stopPropagation(); this.handoff([f]); });
+      if (this.file) {
+        const cur = acts.createEl('button', { cls: 'ata-abtn', text: '加到当前表', attr: { title: '作为附件加到「' + this.file.basename + '」' } });
+        cur.addEventListener('click', (e) => { e.stopPropagation(); this.addAiAtts(this.file.path, [f]); this.openTable(this.file); });
       }
       const sp = c.createDiv('ata-atools');
       if (archiveKind(f) === 'image') this.iconBtn(sp, 'copy', '复制图片', () => copyImageNotice(this.app, f));
@@ -4804,7 +4374,9 @@ class TableWorkbenchView extends ItemView {
             }
             for (const sh of sheets) {
               const path = this.uniquePathSync(folder, multi ? baseName(sh.name) : book, 'csv', taken);
-              lastFile = await this.app.vault.create(path, toCSV(sh.table));
+              const csv = toCSV(sh.table);
+              await this.snapPut(path, csv);
+              lastFile = await this.app.vault.create(path, csv);
               const m = {};
               if (sh.title) m.title = sh.title;
               if (linkId) m.link = { id: linkId, sheet: sh.index };
@@ -4878,6 +4450,7 @@ class TableWorkbenchView extends ItemView {
       const t = { headers: cols, rows: [] };
       const path = await this.uniquePath(this.settings.folder, baseName(name), fmt);
       const content = fmt === 'md' ? (cols.length ? toMarkdown(t) + '\n' : '') : cols.length ? toCSV(t) : '';
+      await this.snapPut(path, content);
       const file = await this.app.vault.create(path, content);
       this.logOp({ type: 'create', path: file.path, text: `新建表格${cols.length ? `（${cols.slice(0, 6).join('、')}${cols.length > 6 ? '…' : ''}）` : ''}` });
       if (!quiet) await this.openTable(file);
@@ -4938,7 +4511,6 @@ class TableWorkbenchView extends ItemView {
         (res.formulasDropped ? `；有 ${res.formulasDropped} 个共享公式因所在单元格被改动而转成了数值` : '');
       new Notice(msg, 10000);
       this.logOp({ type: 'export', path: file.path, name: bookName, text: `按原格式导出 Excel${res.sheetsChanged ? `（${res.sheetsChanged} 个工作表有改动，${res.changed} 个单元格）` : '（没有改动）'}`, file: path });
-      if (this.file && files.some((f) => f.path === this.file.path)) this.addMsg('system', msg);
       if (this.settings.openAfterExport && this.app.openWithDefaultApp) {
         try { await this.app.openWithDefaultApp(path); } catch (e) { /* 打不开就只保存 */ }
       }
@@ -4984,7 +4556,6 @@ class TableWorkbenchView extends ItemView {
       if (fmt === 'xlsx' && this.settings.openAfterExport && this.app.openWithDefaultApp) {
         try { await this.app.openWithDefaultApp(path); } catch (e) { /* 打不开就只保存 */ }
       }
-      if (this.file && file.path === this.file.path) this.addMsg('system', `已导出到：${path}`);
     } catch (e) {
       new Notice('导出失败：' + e.message, 8000);
     }
@@ -5014,12 +4585,12 @@ class TableWorkbenchView extends ItemView {
  * ==================================================================== */
 class AITableSettingTab extends PluginSettingTab {
   constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
+  view() { const l = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0]; return l && l.view instanceof TableWorkbenchView ? l.view : null; }
   display() {
     const { containerEl } = this;
     const s = this.plugin.settings;
     const save = () => this.plugin.saveSettings();
     containerEl.empty();
-    const def = PROVIDER_DEFAULTS[providerOf(s)];
 
     new Setting(containerEl).setName('使用引导').setDesc('一步步介绍每个功能怎么用。')
       .addButton((b) => b.setButtonText('重新查看使用引导').onClick(async () => {
@@ -5027,38 +4598,15 @@ class AITableSettingTab extends PluginSettingTab {
         const v = await this.plugin.activateView();
         if (v) v.startTour();
       }));
-    new Setting(containerEl).setName('AI 服务').setDesc('DeepSeek：在 platform.deepseek.com 申请 API Key；deepseek-flash 能看图片，带图片 / PDF 时插件会自动用它。「OpenAI 兼容」可接通义千问、Kimi、豆包等提供兼容接口的服务。')
-      .addDropdown((d) => {
-        Object.keys(PROVIDER_DEFAULTS).forEach((k) => d.addOption(k, PROVIDER_DEFAULTS[k].label));
-        d.setValue(providerOf(s)).onChange(async (v) => { s.provider = v; s.baseUrl = ''; s.model = ''; await save(); this.display(); });
-      });
-    new Setting(containerEl).setName('API Key').setDesc('只保存在本 vault 的插件数据里（data.json）。')
-      .addText((t) => { t.inputEl.type = 'password'; t.setValue(s.apiKey).onChange(async (v) => { s.apiKey = v.trim(); await save(); }); });
-    new Setting(containerEl).setName('接口地址').setDesc('留空使用默认：' + def.baseUrl)
-      .addText((t) => t.setPlaceholder(def.baseUrl).setValue(s.baseUrl).onChange(async (v) => { s.baseUrl = v.trim(); await save(); }));
-    new Setting(containerEl).setName('模型').setDesc('留空使用默认：' + def.model + (providerOf(s) === 'deepseek' ? '（也可以填 deepseek-v4-pro：更强但只能处理文字，带图片时会自动换成 deepseek-flash）' : ''))
-      .addText((t) => t.setPlaceholder(def.model).setValue(s.model).onChange(async (v) => { s.model = v.trim(); await save(); }));
-    new Setting(containerEl).setName('测试连接').setDesc('发一条很短的消息，确认 API Key 和模型可用。')
-      .addButton((b) => b.setButtonText('测试').onClick(async () => {
-        b.setButtonText('测试中…');
-        try {
-          const raw = await callAI(s, [], '请只回复 JSON：{"reply":"ok","actions":[]}', [], '你是测试助手，只输出 JSON。');
-          new Notice('连接成功 ✓ ' + String(raw).slice(0, 60), 6000);
-        } catch (e) {
-          new Notice('连接失败：' + (e.message || e), 10000);
-        }
-        b.setButtonText('测试');
-      }));
-    new Setting(containerEl).setName('表格保存文件夹').setDesc('导入、新建的表格放在这里，导出文件放在其中的「导出」子文件夹。')
+    new Setting(containerEl).setName('表格保存文件夹').setDesc('导入、新建的表格放在这里；导出文件在其中的「导出」子文件夹，附件在「附件区」。外部 AI 需要能访问这个文件夹。')
       .addText((t) => t.setValue(s.folder).onChange(async (v) => { s.folder = v.trim() || DEFAULT_SETTINGS.folder; await save(); }));
-    new Setting(containerEl).setName('发给 AI 的附件自动存进附件区').setDesc('图片、PDF、表格发给 AI 后，原文件自动存一份到「附件区」，方便以后查找或再次提取。')
-      .addToggle((t) => t.setValue(s.autoArchive !== false).onChange(async (v) => { s.autoArchive = v; await save(); }));
-    new Setting(containerEl).setName('AI 修改前先预览').setDesc('开启后，AI 的修改会先以「黄色 = 修改、绿色 = 新增」的形式给你看，点「应用」才写入表格。')
-      .addToggle((t) => t.setValue(s.preview !== false).onChange(async (v) => { s.preview = v; await save(); }));
+    new Setting(containerEl).setName('给 AI 的说明文件').setDesc('插件会在表格文件夹里生成「AI使用说明.md」「表格目录.md」以及指向它们的 CLAUDE.md、AGENTS.md，告诉外部 AI 表格在哪、怎么改。每次打开工作台都会自动更新。')
+      .addButton((b) => b.setButtonText('现在重新生成').onClick(async () => {
+        const v = this.view() || (await this.plugin.activateView());
+        if (v) { await v.writeAiGuide(); new Notice('已更新 AI 使用说明和表格目录。'); }
+      }));
     new Setting(containerEl).setName('导出 Excel 后自动打开').setDesc('导出 .xlsx 后用系统默认程序（Excel / WPS）打开。')
       .addToggle((t) => t.setValue(s.openAfterExport !== false).onChange(async (v) => { s.openAfterExport = v; await save(); }));
-    new Setting(containerEl).setName('发送给 AI 的最大行数').setDesc('表格超过这个行数时，只把前面的行发给 AI（控制费用）。')
-      .addText((t) => t.setValue(String(s.maxRows)).onChange(async (v) => { s.maxRows = Math.max(1, parseInt(v) || 300); await save(); }));
   }
 }
 
@@ -5069,6 +4617,8 @@ class AITableAssistantPlugin extends Plugin {
     if (!Array.isArray(this.settings.pinned)) this.settings.pinned = [];
     if (!Array.isArray(this.settings.recent)) this.settings.recent = [];
     if (!this.settings.archiveMeta || typeof this.settings.archiveMeta !== 'object') this.settings.archiveMeta = {};
+    /* 旧版本内置 AI 的设置（包括 API Key）已经不用了，从插件数据里清掉 */
+    if (OBSOLETE_SETTINGS.some((k) => k in this.settings)) { OBSOLETE_SETTINGS.forEach((k) => delete this.settings[k]); await this.saveSettings(); }
     if (this.settings.master && !this.settings.pinned.includes(this.settings.master)) this.settings.pinned.push(this.settings.master);
     this.registerView(VIEW_TYPE, (leaf) => new TableWorkbenchView(leaf, this));
     this.addRibbonIcon('table', '表格工作台', () => this.activateView());
@@ -5117,6 +4667,6 @@ class AITableAssistantPlugin extends Plugin {
 
 AITableAssistantPlugin._test = {
   parseCSV, toCSV, gridToTable, findMdTable, toMarkdown, parseXLSX, toXLSX,
-  applyActions, tableToPrompt, extractJSON, repairJSON, salvageReply, normalizeTable, collectDropped, cleanGrid, decodeText, newTrack, upsertRows, readWorkbook, toXLSXBook, fileToSheets, patchWorkbook, cloneTable,
+  normalizeTable, collectDropped, cleanGrid, decodeText, readWorkbook, toXLSXBook, fileToSheets, patchWorkbook, cloneTable, diffTables, hashStr,
 };
 module.exports = AITableAssistantPlugin;

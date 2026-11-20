@@ -1,9 +1,9 @@
 {
   "id": "ai-table-assistant",
-  "name": "AI 表格助手",
-  "version": "2.0.1",
+  "name": "表格工作台",
+  "version": "3.0.0",
   "minAppVersion": "1.4.0",
-  "description": "表格工作台：Obsidian 负责存放和展示表格，外部 AI（Claude、ChatGPT 等）直接修改表格文件，改动自动标出、可确认或撤销；多工作表 Excel 分组管理、显示原表颜色、改完按原格式整本导出；附件区存单据。",
+  "description": "表格工作台：Excel 导入后按原样显示（标题行、合并单元格、列宽、颜色、边框、数字格式），可直接修改，按原格式整本导出；多工作表分组、外部修改提示与撤销、操作记录、附件归档。",
   "author": "Unclesam-13",
   "isDesktopOnly": false,
   "authorUrl": "https://github.com/Unclesam-13"

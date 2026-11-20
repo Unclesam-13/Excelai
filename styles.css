@@ -627,3 +627,30 @@ input.ata-route-search { width: 100%; margin-bottom: 8px; }
 
 .ata-tour-path { display: block; padding: 4px 8px; border-radius: 6px; background: var(--background-secondary); font-size: 12px; word-break: break-all; cursor: copy; }
 .ata-tablepane .ata-review { margin: 8px 8px 0; }
+
+/* ── 工作区单栏（不再有右侧面板） ── */
+.ata-ws { grid-template-columns: minmax(0, 1fr); }
+.ata-tablefoot .ata-seg-btn { display: inline-flex; align-items: center; gap: 5px; }
+.ata-seg-ico { display: inline-flex; }
+.ata-seg-ico svg { width: 14px; height: 14px; }
+.ata-zoom { display: inline-flex; align-items: center; gap: 2px; }
+.ata-root button.ata-zoom-lab { height: 26px; min-width: 52px; padding: 0 6px; font-size: 12px; border: 1px solid var(--ata-border); background: var(--ata-surface); box-shadow: none; border-radius: 6px; cursor: pointer; font-variant-numeric: tabular-nums; }
+
+/* ── 原表样式（像 Excel 一样显示） ── */
+.ata-root .ata-tablewrap.ata-xlwrap { position: relative; overflow: auto; background: #ffffff; color: #000000; color-scheme: light; }
+.ata-xlvp { position: sticky; top: 0; left: 0; overflow: hidden; z-index: 1; background: #fff; }
+.ata-xlspacer { pointer-events: none; }
+.ata-xlpane { position: absolute; overflow: hidden; }
+.ata-xlpane.xl-corner { background: #f3f3f3; border-right: 1px solid #c8c8c8; border-bottom: 1px solid #c8c8c8; z-index: 3; }
+.ata-xlpane.xl-colhdr, .ata-xlpane.xl-rowhdr { background: #f3f3f3; z-index: 2; }
+.ata-xlpane .xh { position: absolute; top: 0; height: 22px; box-sizing: border-box; border-right: 1px solid #d0d0d0; border-bottom: 1px solid #c8c8c8; font: 12px/21px var(--font-interface); color: #444; text-align: center; overflow: hidden; }
+.ata-xlpane .xr { position: absolute; left: 0; width: 46px; box-sizing: border-box; border-bottom: 1px solid #d0d0d0; border-right: 1px solid #c8c8c8; font: 11px var(--font-interface); color: #444; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.ata-xlpane .xr.xrn { color: #16a34a; font-weight: 700; }
+.ata-xlpane .xh.xhs, .ata-xlpane .xr.xhs { background: #d6e8d4; color: #1e5c1a; font-weight: 700; }
+.ata-xlpane .xc { position: absolute; box-sizing: border-box; display: flex; padding: 0 3px 1px; overflow: hidden; white-space: nowrap; line-height: 1.25; color: #000; font-family: "等线", "DengXian", "Microsoft YaHei", var(--font-interface); cursor: cell; }
+.ata-xlpane .xc.xw { white-space: pre-wrap; word-break: break-all; }
+.ata-xlpane .xc.xo { overflow: visible; }
+.ata-xlpane .xc.xo > span { display: block; white-space: nowrap; overflow: hidden; flex: none; }
+.ata-xlpane .xc.xadd { box-shadow: inset 0 0 0 999px rgba(34, 197, 94, .28); }
+.ata-xlpane .xc.xmod { box-shadow: inset 0 0 0 999px rgba(234, 179, 8, .38), inset 0 0 0 1px #ca8a04; }
+.ata-xlpane .xc.xsel { outline: 2px solid #107c41; outline-offset: -2px; z-index: 2; }

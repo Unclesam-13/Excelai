@@ -14,6 +14,7 @@ const GUIDE_FILES = ['AI使用说明.md', '表格目录.md', 'CLAUDE.md', 'AGENT
 const OBSOLETE_SETTINGS = ['provider', 'apiKey', 'baseUrl', 'model', 'maxRows', 'preview', 'autoArchive'];
 
 const OLD_FOLDER = 'AI表格助手';
+const AUTO_DIR = '自动处理';
 const DEFAULT_FOLDER = '表格工作台';
 const DEFAULT_SETTINGS = {
   folder: DEFAULT_FOLDER,
@@ -2082,6 +2083,8 @@ class TableWorkbenchView extends ItemView {
       this.onVaultChange(f);
     }));
     this.registerEvent(this.app.vault.on('create', (f) => {
+      const ak = this.snapReady && this.autoKind(f);
+      if (ak) this.queueAuto(f, ak);
       if (this.snapReady && !this.importRun && this.isTableFile(f)) setTimeout(() => this.checkFile(f, 'create'), 300);
       this.onVaultChange(f);
     }));
@@ -2090,7 +2093,12 @@ class TableWorkbenchView extends ItemView {
       this.onExtDelete(f);
       this.onVaultChange(f);
     }));
-    this.registerEvent(this.app.vault.on('rename', (f, old) => { this.onExtRename(f, old); this.scheduleRender(); }));
+    this.registerEvent(this.app.vault.on('rename', (f, old) => {
+      this.onExtRename(f, old);
+      const ak = this.snapReady && this.autoKind(f);
+      if (ak) this.queueAuto(f, ak);
+      this.scheduleRender();
+    }));
 
     /* 旧版本的表格文件夹叫「AI表格助手」，整体改名为「表格工作台」（连同隐藏的 .ata 数据一起搬） */
     try {
@@ -2109,6 +2117,9 @@ class TableWorkbenchView extends ItemView {
     setTimeout(async () => {
       try { await this.scanExternal(); } catch (e) { console.warn('[表格工作台] 检查外部修改失败', e); this.snapReady = true; }
       try { await this.removeOldGuides(); } catch (e) { /* 不影响使用 */ }
+      if (this.settings.autoProcess !== false) {
+        try { await this.ensureAutoDirs(); this.scanAuto(); } catch (e) { console.warn('[表格工作台] 准备自动处理文件夹失败', e); }
+      }
     }, 300);
   }
 
@@ -3100,6 +3111,268 @@ class TableWorkbenchView extends ItemView {
     if (fixed) { await this.plugin.saveSettings(); new Notice(`已恢复 ${fixed} 张表和原 Excel 的对应关系。`); }
   }
 
+  /* ================= 自动处理：放文件即导入、放请求即导出、链接调用 ================= */
+  autoDir() { return normalizePath(this.settings.folder + '/' + AUTO_DIR); }
+
+  async ensureAutoDirs() {
+    const d = this.autoDir();
+    for (const sub of ['', '/导入', '/导入/替换', '/导入/已完成', '/导出', '/导出/已完成']) await this.ensureFolder(d + sub);
+    const help = `${d}/使用说明.md`;
+    const f = this.app.vault.getAbstractFileByPath(help);
+    const text = this.autoHelpText();
+    if (!(f instanceof TFile)) { try { await this.app.vault.create(help, text); } catch (e) { /* 已存在 */ } }
+    else if ((await this.app.vault.read(f)).startsWith('<!-- 表格工作台自动生成') ) { const old = await this.app.vault.read(f); if (old !== text) await this.app.vault.modify(f, text); }
+  }
+
+  autoHelpText() {
+    const abs = this.absPath(this.autoDir());
+    const vault = this.app.vault.getName ? this.app.vault.getName() : '';
+    const enc = encodeURIComponent;
+    return `<!-- 表格工作台自动生成，会随插件更新；要写自己的笔记请另建文件 -->
+# 自动处理
+
+Obsidian 打开着的时候，往这里放文件就会自动处理，其它程序（脚本、AI 工具等）也能用。
+
+文件夹位置：\`${abs}\`
+
+## 自动导入 Excel
+
+- 把 .xlsx / .xlsm / .csv / .tsv 放进 \`导入/\`：自动转换成表格工作台里的表（和点「导入文件」一样），同名的会另存一份，不覆盖。
+- 放进 \`导入/替换/\`：如果已经导入过同名的 Excel，先把旧的表移到回收站，再导入新的（适合「每次都拿最新版原表来改」）。
+- 处理完，原文件移到 \`导入/已完成/\`，旁边生成 \`原文件名.结果.txt\`，写着生成了哪些表（每张表是一个 CSV 文件，可以直接改）。
+
+## 自动导出 Excel
+
+在 \`导出/\` 里新建一个 .txt 文件（文件名随意），内容写要导出的表，每项一行：
+
+\`\`\`
+表格: 史2026-客户订单待发明细！！（26-2.27(2)
+输出: D:\\桌面\\订单-最新.xlsx
+\`\`\`
+
+- 「表格」可以写 Excel 工作簿名、表名或 CSV 文件路径。从 Excel 导入的表会按原格式（颜色、公式、合并单元格、图片）整本导出。
+- 「输出」可以不写，不写就只保存在表格文件夹的「导出」里；写了会再复制一份到这个位置。
+- 处理完，请求文件移到 \`导出/已完成/\`，旁边生成 \`请求文件名.结果.txt\`，写着导出文件的位置或出错原因。
+
+## 用链接调用
+
+也可以打开下面这样的链接（Windows 命令行用 \`start "" "链接"\`，Mac 用 \`open "链接"\`）：
+
+- 导入：\`obsidian://table-workbench?vault=${enc(vault)}&action=import&path=${enc('D:\\\\订单.xlsx')}\`（加 \`&mode=replace\` 表示替换同名的）
+- 导出：\`obsidian://table-workbench?vault=${enc(vault)}&action=export&table=${enc('工作簿名')}&out=${enc('D:\\\\订单-最新.xlsx')}\`
+- 打开某张表：\`obsidian://table-workbench?vault=${enc(vault)}&action=open&table=${enc('表名')}\`
+
+链接调用的结果写在 \`${AUTO_DIR}/最近一次结果.txt\`。
+`;
+  }
+
+  /** 按名字找表：CSV 路径、工作簿名、工作表名、文件名都可以 */
+  resolveTable(name) {
+    name = String(name || '').trim().replace(/^["'「]|["'」]$/g, '');
+    if (!name) return null;
+    const meta = this.settings.meta || {};
+    const files = this.tableFiles();
+    const norm = (x) => normalizePath(String(x)).toLowerCase();
+    const base = this.basePath();
+    let rel = name;
+    if (base && name.replace(/\\/g, '/').toLowerCase().startsWith(base.replace(/\\/g, '/').toLowerCase() + '/')) rel = name.replace(/\\/g, '/').slice(base.length + 1);
+    let f = files.find((x) => norm(x.path) === norm(rel)) || files.find((x) => norm(x.path) === norm(rel + '.csv'));
+    if (f) return f;
+    const book = name.replace(/\.(xlsx|xlsm|csv)$/i, '');
+    const inBook = files.filter((x) => meta[x.path] && meta[x.path].workbook === book).sort((a, b) => (meta[a.path].sheetIndex || 0) - (meta[b.path].sheetIndex || 0));
+    if (inBook.length) return inBook[0];
+    return files.find((x) => x.basename === book) || files.find((x) => meta[x.path] && meta[x.path].sheet === book) || null;
+  }
+
+  /** 导出一张表或它所在的整本工作簿；out 是另外再存一份的位置（可以是库外的绝对路径） */
+  async runExport(target, out, from) {
+    const meta = this.settings.meta || {};
+    const tm = meta[target.path] || {};
+    const sibs = this.workbookSiblings(target);
+    const linked = tm.link && (await this.app.vault.adapter.exists(`${this.ataDir()}/sources/${tm.link.id}.xlsx`));
+    let res;
+    if (linked) res = await this.exportLinked(target, sibs.length > 1 ? sibs : [target], { quiet: true, from });
+    else if (sibs.length > 1) res = await this.exportWorkbook(target, sibs, { quiet: true, from });
+    else {
+      const t = target.extension === 'md' ? ((findMdTable(await this.app.vault.read(target)) || {}).table || { headers: [], rows: [] }) : gridToTable(parseCSV(await this.app.vault.read(target)));
+      res = await this.exportTable(target, t, 'xlsx', { quiet: true, from });
+    }
+    if (!res || !res.path) throw new Error('导出没有生成文件');
+    let copied = '', copyError = '';
+    if (out) try {
+      const fs = nodeReq('fs'), path = nodeReq('path');
+      if (!fs || !path) throw new Error('只有电脑版 Obsidian 才能复制到库外的位置');
+      let dest = String(out).trim().replace(/^["']|["']$/g, '');
+      if (!path.isAbsolute(dest)) dest = path.join(this.basePath(), dest);
+      if (!/\.xlsx$/i.test(dest)) {
+        let isDir = false;
+        try { isDir = (await fs.promises.stat(dest)).isDirectory(); } catch (e) { /* 不存在 */ }
+        dest = isDir ? path.join(dest, res.path.split('/').pop()) : dest + '.xlsx';
+      }
+      await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+      await fs.promises.writeFile(dest, Buffer.from(await this.app.vault.adapter.readBinary(res.path)));
+      copied = dest;
+    } catch (e) { copyError = e.message || String(e); }
+    return { path: res.path, abs: this.absPath(res.path), copied, copyError, changed: res.changed, sheetsChanged: res.sheetsChanged, linked: !!linked };
+  }
+
+  /** 替换模式：先把同名工作簿已经导入的表移到回收站 */
+  async removeImported(fileName) {
+    const book = baseName(fileName);
+    const meta = this.settings.meta || {};
+    const root = normalizePath(this.settings.folder);
+    const old = this.tableFiles().filter((f) => (meta[f.path] && meta[f.path].workbook === book) || f.path === `${root}/${book}.csv`);
+    if (old.length) {
+      await this.deleteFiles(old);
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    return old.length;
+  }
+
+  async runImport(list, replace, from) {
+    let removed = 0;
+    if (replace) for (const x of list) removed += await this.removeImported(x.file.name);
+    const res = (await this.importBatch(list, { quiet: true, wait: true, from })) || { ok: 0, failed: [], paths: [] };
+    res.removed = removed;
+    return res;
+  }
+
+  async writeResult(path, lines) {
+    try {
+      const f = this.app.vault.getAbstractFileByPath(path);
+      const text = lines.join('\n') + '\n';
+      if (f instanceof TFile) await this.app.vault.modify(f, text); else await this.app.vault.create(path, text);
+    } catch (e) { console.warn('[表格工作台] 写结果失败', e); }
+  }
+
+  stamp() {
+    const d = new Date(), z = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}:${z(d.getSeconds())}`;
+  }
+
+  async moveDone(tf, dir) {
+    await this.ensureFolder(dir);
+    const dot = tf.name.lastIndexOf('.');
+    const dest = await this.uniquePath(dir, dot > 0 ? tf.name.slice(0, dot) : tf.name, dot > 0 ? tf.name.slice(dot + 1) : 'bin');
+    await this.app.fileManager.renameFile(tf, dest);
+    return dest;
+  }
+
+  /** 「自动处理/导入」里出现了表格文件 */
+  async autoImport(tf) {
+    const d = this.autoDir();
+    const replace = tf.path.startsWith(d + '/导入/替换/');
+    const file = new File([await this.app.vault.readBinary(tf)], tf.name, { type: MIME[(tf.extension || '').toLowerCase()] || '' });
+    const lines = [`时间：${this.stamp()}`, `原文件：${tf.name}`, `方式：${replace ? '替换同名' : '新导入'}`];
+    try {
+      const res = await this.runImport([{ file, rel: tf.name }], replace, '自动处理');
+      if (res.removed) lines.push(`已把旧版本的 ${res.removed} 张表移到回收站`);
+      lines.push(`结果：${res.ok ? `成功，生成 ${res.ok} 张表` : '没有导入任何表格'}`);
+      if (res.failed && res.failed.length) lines.push('失败：' + res.failed.join('；'));
+      if (res.paths && res.paths.length) { lines.push('', '生成的表格（每张表一个 CSV 文件）：'); res.paths.forEach((p) => lines.push('- ' + this.absPath(p))); }
+    } catch (e) {
+      lines.push('结果：失败，' + (e.message || e));
+    }
+    const moved = await this.moveDone(tf, d + '/导入/已完成');
+    await this.writeResult(moved.replace(/\.[^.\/]+$/, '') + '.结果.txt', lines);
+  }
+
+  /** 「自动处理/导出」里出现了请求文件 */
+  async autoExport(tf) {
+    const d = this.autoDir();
+    const text = await this.app.vault.read(tf);
+    let req = {};
+    try { req = JSON.parse(text); } catch (e) {
+      text.split(/\r?\n/).forEach((line) => {
+        const m = /^\s*(表格|表|工作簿|table|输出|out|output)\s*[:：=]\s*(.+?)\s*$/i.exec(line);
+        if (m) req[/^(输出|out|output)$/i.test(m[1]) ? 'out' : 'table'] = m[2];
+      });
+      if (!req.table) { const first = text.split(/\r?\n/).map((x) => x.trim()).find(Boolean); if (first) req.table = first; }
+    }
+    const name = req.table || req['表格'] || req['工作簿'];
+    const out = req.out || req['输出'];
+    const lines = [`时间：${this.stamp()}`, `要导出：${name || '（没写）'}`];
+    try {
+      const target = this.resolveTable(name);
+      if (!target) throw new Error(`找不到「${name}」这张表或工作簿`);
+      const res = await this.runExport(target, out, '自动处理');
+      lines.push('结果：成功', `导出文件：${res.abs}`);
+      if (res.copied) lines.push(`另存到：${res.copied}`);
+      if (res.copyError) lines.push(`另存失败：${res.copyError}（导出文件本身已经生成）`);
+      lines.push(`方式：${res.linked ? `按原 Excel 格式导出${res.sheetsChanged ? `（${res.sheetsChanged} 个工作表有改动，共 ${res.changed} 个单元格）` : '（和原文件一致）'}` : '普通 Excel'}`);
+    } catch (e) {
+      lines.push('结果：失败，' + (e.message || e));
+    }
+    const moved = await this.moveDone(tf, d + '/导出/已完成');
+    await this.writeResult(moved.replace(/\.[^.\/]+$/, '') + '.结果.txt', lines);
+  }
+
+  /** 排队处理，一次只做一件，避免同时导入导出 */
+  queueAuto(tf, kind) {
+    if (!this.autoSeen) this.autoSeen = new Set();
+    if (this.autoSeen.has(tf.path)) return;
+    this.autoSeen.add(tf.path);
+    this.autoQ = (this.autoQ || Promise.resolve()).then(async () => {
+      /* 等文件写完（大小不再变化） */
+      let last = -1;
+      for (let i = 0; i < 40; i++) {
+        const cur = this.app.vault.getAbstractFileByPath(tf.path);
+        if (!(cur instanceof TFile)) return;
+        if (cur.stat.size === last && last > 0) break;
+        last = cur.stat.size;
+        await new Promise((r) => setTimeout(r, 700));
+      }
+      try { if (kind === 'import') await this.autoImport(tf); else await this.autoExport(tf); }
+      catch (e) { console.warn('[表格工作台] 自动处理失败', e); new Notice('自动处理失败：' + (e.message || e)); }
+    }).finally(() => this.autoSeen.delete(tf.path));
+  }
+
+  autoKind(f) {
+    if (!(f instanceof TFile) || this.settings.autoProcess === false) return null;
+    const d = this.autoDir();
+    if (/\.结果\.txt$/.test(f.name) || f.name === '使用说明.md' || f.name === '最近一次结果.txt') return null;
+    if (f.path.startsWith(d + '/导入/') && !f.path.startsWith(d + '/导入/已完成/') && TABLE_EXT.test(f.name) && !f.name.startsWith('~$')) return 'import';
+    if (f.path.startsWith(d + '/导出/') && !f.path.startsWith(d + '/导出/已完成/') && /\.(txt|json|md)$/i.test(f.name)) return 'export';
+    return null;
+  }
+
+  scanAuto() {
+    this.app.vault.getFiles().forEach((f) => { const k = this.autoKind(f); if (k) this.queueAuto(f, k); });
+  }
+
+  /** obsidian://table-workbench?action=…  */
+  async handleProtocol(p) {
+    const lines = [`时间：${this.stamp()}`, `操作：${p.action || ''}`];
+    try {
+      if (p.action === 'import') {
+        if (!p.path) throw new Error('缺少 path 参数（要导入的文件的完整路径）');
+        const list = await filesFromPaths(String(p.path).split('|').filter(Boolean));
+        if (!list.length) throw new Error('读不到这个文件');
+        const res = await this.runImport(list, p.mode === 'replace', '链接调用');
+        lines.push(`结果：${res.ok ? `成功，生成 ${res.ok} 张表` : '没有导入任何表格'}`);
+        if (res.failed && res.failed.length) lines.push('失败：' + res.failed.join('；'));
+        (res.paths || []).forEach((x) => lines.push('- ' + this.absPath(x)));
+      } else if (p.action === 'export') {
+        const target = this.resolveTable(p.table);
+        if (!target) throw new Error(`找不到「${p.table || ''}」这张表或工作簿`);
+        const res = await this.runExport(target, p.out, '链接调用');
+        lines.push('结果：成功', `导出文件：${res.abs}`);
+        if (res.copied) lines.push(`另存到：${res.copied}`);
+        if (res.copyError) lines.push(`另存失败：${res.copyError}（导出文件本身已经生成）`);
+      } else if (p.action === 'open') {
+        const target = this.resolveTable(p.table);
+        if (!target) throw new Error(`找不到「${p.table || ''}」这张表或工作簿`);
+        await this.openTable(target);
+        lines.push('结果：已打开 ' + target.path);
+      } else throw new Error('不认识的操作，可以用 import / export / open');
+    } catch (e) {
+      lines.push('结果：失败，' + (e.message || e));
+      new Notice('表格工作台：' + (e.message || e), 8000);
+    }
+    await this.ensureFolder(this.autoDir());
+    await this.writeResult(`${this.autoDir()}/最近一次结果.txt`, lines);
+  }
+
   /* ================= 原表样式视图 ================= */
   isExcelMode() {
     if (!this.file || !this.link || this.file.extension !== 'csv') return false;
@@ -3389,7 +3662,7 @@ class TableWorkbenchView extends ItemView {
   isTableFile(f) {
     if (!(f instanceof TFile)) return false;
     const folder = normalizePath(this.settings.folder) + '/';
-    if (f.path.startsWith(this.archiveDir() + '/') || f.path.startsWith(folder + '导出/')) return false;
+    if (f.path.startsWith(this.archiveDir() + '/') || f.path.startsWith(folder + '导出/') || f.path.startsWith(folder + AUTO_DIR + '/')) return false;
     if (f.path.startsWith(folder) && GUIDE_FILES.includes(f.path.slice(folder.length))) return false;
     if (f.extension === 'csv') return true;
     if (f.extension === 'md') {
@@ -4700,8 +4973,12 @@ class TableWorkbenchView extends ItemView {
     return p;
   }
 
-  async importBatch(list) {
-    if (this.importRun) { new Notice('正在导入中，请等这一批完成或先取消。'); return; }
+  async importBatch(list, opts) {
+    opts = opts || {};
+    if (this.importRun) {
+      if (!opts.wait) { new Notice('正在导入中，请等这一批完成或先取消。'); return; }
+      while (this.importRun) await new Promise((r) => setTimeout(r, 300));
+    }
     const tables = list.filter((x) => TABLE_EXT.test(x.file.name) && !x.file.name.startsWith('~$'));
     const skipped = list.length - tables.length;
     if (!tables.length) { new Notice('没有找到可导入的表格文件（支持 csv / tsv / xlsx / md）。'); return; }
@@ -4765,6 +5042,7 @@ class TableWorkbenchView extends ItemView {
               const csv = toCSV(sh.table);
               await this.snapPut(path, csv);
               lastFile = await this.app.vault.create(path, csv);
+              (run.paths || (run.paths = [])).push(path);
               const m = {};
               if (sh.title) m.title = sh.title;
               if (linkId) m.link = { id: linkId, sheet: sh.index };
@@ -4798,7 +5076,8 @@ class TableWorkbenchView extends ItemView {
     if (skipped) msg.push(`${skipped} 个非表格文件已跳过`);
     if (failed.length) msg.push(`${failed.length} 个失败：${failed.slice(0, 3).join('；')}${failed.length > 3 ? '…' : ''}`);
     new Notice(msg.join('，'), failed.length ? 12000 : 6000);
-    if (ok || failed.length) this.logOp({ type: 'import', text: msg.join('，'), items: (run.names || []).slice(0, 300) });
+    if (ok || failed.length) this.logOp({ type: 'import', text: msg.join('，') + (opts.from ? `（${opts.from}）` : ''), items: (run.names || []).slice(0, 300) });
+    if (opts.quiet) { await this.render(); return { ok, failed, paths: run.paths || [], names: run.names || [] }; }
     if (ok === 1 && lastFile) await this.openTable(lastFile);
     else {
       if (ok > 1) { this.tab = 'library'; this.libFilter = '未分类'; }
@@ -4871,7 +5150,8 @@ class TableWorkbenchView extends ItemView {
   }
 
   /** 把改动写回原 Excel：颜色、合并单元格、图片、公式、列宽、没改的工作表都保留 */
-  async exportLinked(file, files) {
+  async exportLinked(file, files, opts) {
+    opts = opts || {};
     const notice = new Notice('正在按原 Excel 格式导出…', 0);
     try {
       await this.flushSave();
@@ -4898,17 +5178,20 @@ class TableWorkbenchView extends ItemView {
       const msg = `已按原格式导出到 ${path}：${res.sheetsChanged ? `${res.sheetsChanged} 个工作表有改动，共 ${res.changed} 个单元格` : '没有改动，和原文件一致'}` +
         (res.formulasDropped ? `；有 ${res.formulasDropped} 个共享公式因所在单元格被改动而转成了数值` : '');
       new Notice(msg, 10000);
-      this.logOp({ type: 'export', path: file.path, name: bookName, text: `按原格式导出 Excel${res.sheetsChanged ? `（${res.sheetsChanged} 个工作表有改动，${res.changed} 个单元格）` : '（没有改动）'}`, file: path });
-      if (this.settings.openAfterExport && this.app.openWithDefaultApp) {
+      this.logOp({ type: 'export', path: file.path, name: bookName, text: `按原格式导出 Excel${res.sheetsChanged ? `（${res.sheetsChanged} 个工作表有改动，${res.changed} 个单元格）` : '（没有改动）'}${opts.from ? `（${opts.from}）` : ''}`, file: path });
+      if (!opts.quiet && this.settings.openAfterExport && this.app.openWithDefaultApp) {
         try { await this.app.openWithDefaultApp(path); } catch (e) { /* 打不开就只保存 */ }
       }
+      return { path, changed: res.changed, sheetsChanged: res.sheetsChanged };
     } catch (e) {
       notice.hide();
+      if (opts.quiet) throw e;
       new Notice('按原格式导出失败：' + (e.message || e) + '。可以改用普通 Excel 导出。', 10000);
     }
   }
 
-  async exportWorkbook(file, sibs) {
+  async exportWorkbook(file, sibs, opts) {
+    opts = opts || {};
     try {
       await this.flushSave();
       const meta = this.settings.meta || {};
@@ -4922,16 +5205,19 @@ class TableWorkbenchView extends ItemView {
       const path = await this.uniquePath(this.settings.folder + '/导出', `${meta[file.path].workbook}-${stamp}`, 'xlsx');
       await this.app.vault.createBinary(path, toXLSXBook(sheets));
       new Notice(`已导出整个工作簿（${sheets.length} 个工作表）到 ${path}`, 8000);
-      this.logOp({ type: 'export', path: file.path, name: meta[file.path].workbook, text: `导出整个工作簿（${sheets.length} 个工作表）`, file: path });
-      if (this.settings.openAfterExport && this.app.openWithDefaultApp) {
+      this.logOp({ type: 'export', path: file.path, name: meta[file.path].workbook, text: `导出整个工作簿（${sheets.length} 个工作表）${opts.from ? `（${opts.from}）` : ''}`, file: path });
+      if (!opts.quiet && this.settings.openAfterExport && this.app.openWithDefaultApp) {
         try { await this.app.openWithDefaultApp(path); } catch (e) { /* 打不开就只保存 */ }
       }
+      return { path };
     } catch (e) {
+      if (opts.quiet) throw e;
       new Notice('导出失败：' + e.message, 8000);
     }
   }
 
-  async exportTable(file, table, fmt) {
+  async exportTable(file, table, fmt, opts) {
+    opts = opts || {};
     try {
       const d = new Date(), z = (n) => String(n).padStart(2, '0');
       const stamp = `${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}`;
@@ -4940,11 +5226,13 @@ class TableWorkbenchView extends ItemView {
       else if (fmt === 'csv') await this.app.vault.create(path, '﻿' + toCSV(table));
       else await this.app.vault.create(path, toMarkdown(table) + '\n');
       new Notice('已导出到 ' + path, 8000);
-      this.logOp({ type: 'export', path: file.path, text: `导出为 ${fmt.toUpperCase()}`, file: path });
-      if (fmt === 'xlsx' && this.settings.openAfterExport && this.app.openWithDefaultApp) {
+      this.logOp({ type: 'export', path: file.path, text: `导出为 ${fmt.toUpperCase()}${opts.from ? `（${opts.from}）` : ''}`, file: path });
+      if (!opts.quiet && fmt === 'xlsx' && this.settings.openAfterExport && this.app.openWithDefaultApp) {
         try { await this.app.openWithDefaultApp(path); } catch (e) { /* 打不开就只保存 */ }
       }
+      return { path };
     } catch (e) {
+      if (opts.quiet) throw e;
       new Notice('导出失败：' + e.message, 8000);
     }
   }
@@ -4988,6 +5276,18 @@ class AITableSettingTab extends PluginSettingTab {
       }));
     new Setting(containerEl).setName('表格保存文件夹').setDesc('导入、新建的表格放在这里；导出文件在其中的「导出」子文件夹，附件在「附件区」。')
       .addText((t) => t.setValue(s.folder).onChange(async (v) => { s.folder = v.trim() || DEFAULT_SETTINGS.folder; await save(); }));
+    new Setting(containerEl).setName('自动处理文件夹').setDesc(`开启后，往「${s.folder}/${AUTO_DIR}/导入」放 Excel 会自动导入，往「${AUTO_DIR}/导出」放请求文件会自动导出；也可以用 obsidian://table-workbench 链接调用。用法见该文件夹里的「使用说明」。Obsidian 启动时会在后台打开工作台来处理。`)
+      .addToggle((t) => t.setValue(s.autoProcess !== false).onChange(async (v) => {
+        s.autoProcess = v; await save();
+        if (v) { const view = this.view() || (await this.plugin.activateView(true, true)); if (view) { await view.ensureAutoDirs(); view.scanAuto(); } }
+      }))
+      .addButton((b) => b.setButtonText('打开使用说明').onClick(async () => {
+        const view = this.view() || (await this.plugin.activateView(true, true));
+        if (!view) return;
+        await view.ensureAutoDirs();
+        const f = this.app.vault.getAbstractFileByPath(`${view.autoDir()}/使用说明.md`);
+        if (f instanceof TFile) { this.app.setting.close(); this.app.workspace.getLeaf('tab').openFile(f); }
+      }));
     new Setting(containerEl).setName('导出 Excel 后自动打开').setDesc('导出 .xlsx 后用系统默认程序（Excel / WPS）打开。')
       .addToggle((t) => t.setValue(s.openAfterExport !== false).onChange(async (v) => { s.openAfterExport = v; await save(); }));
   }
@@ -5031,6 +5331,16 @@ class AITableAssistantPlugin extends Plugin {
       if (this.settings.meta[f.path]) { delete this.settings.meta[f.path]; await this.saveSettings(); }
     }));
     this.addSettingTab(new AITableSettingTab(this.app, this));
+    /* obsidian://table-workbench?action=import|export|open */
+    this.registerObsidianProtocolHandler('table-workbench', async (params) => {
+      const v = await this.activateView(true);
+      if (v) await v.handleProtocol(params);
+    });
+    /* 自动处理要在后台运行：Obsidian 启动后把工作台在后台打开（不抢焦点） */
+    this.app.workspace.onLayoutReady(() => {
+      if (this.settings.autoProcess === false) return;
+      if (!this.app.workspace.getLeavesOfType(VIEW_TYPE).length) this.activateView(true, true);
+    });
   }
 
   async saveSettings() {
@@ -5074,16 +5384,17 @@ class AITableAssistantPlugin extends Plugin {
     this.restoredFromBackup = Object.keys(b.meta).length;
   }
 
-  async activateView() {
+  async activateView(quiet, background) {
     const ws = this.app.workspace;
     let leaf = ws.getLeavesOfType(VIEW_TYPE)[0];
     /* 旧版本放在侧边栏，迁到主编辑区 */
     if (leaf && leaf.getRoot() !== ws.rootSplit) { leaf.detach(); leaf = null; }
     if (!leaf) {
       leaf = ws.getLeaf('tab');
-      await leaf.setViewState({ type: VIEW_TYPE, active: true });
+      await leaf.setViewState({ type: VIEW_TYPE, active: !background });
     }
-    ws.revealLeaf(leaf);
+    if (leaf.loadIfDeferred) await leaf.loadIfDeferred();
+    if (!background) ws.revealLeaf(leaf);
     return leaf.view instanceof TableWorkbenchView ? leaf.view : null;
   }
 }

@@ -1,7 +1,7 @@
 {
   "id": "ai-table-assistant",
   "name": "表格工作台",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "minAppVersion": "1.4.0",
   "description": "表格工作台：Excel 导入后按原样显示（标题行、合并单元格、列宽、颜色、边框、数字格式），可直接修改，按原格式整本导出；多工作表分组、外部修改提示与撤销、操作记录、附件归档。",
   "author": "Unclesam-13",
